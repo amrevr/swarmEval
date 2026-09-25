@@ -1,2 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+runs/
+.pytest_cache/
 .DS_Store
 .idea/

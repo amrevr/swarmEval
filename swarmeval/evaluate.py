@@ -1,0 +1,189 @@
+"""Top-level evaluation: run a swarm on a benchmark and summarise the result."""
+from __future__ import annotations
+
+import json
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+from .metrics.efficiency import EfficiencyMetrics, compute_efficiency
+from .metrics.performance import PerformanceMetrics, compute_performance
+from .pricing import PricingTable
+from .recorder import Clock
+from .runner import RunOptions, RunSet, SwarmRunner
+from .schema import Benchmark, Trajectory
+from .stats import Summary, mean, summarize
+
+
+@dataclass
+class EfficiencySummary:
+    """Efficiency metrics aggregated over all runs in a RunSet."""
+    tokens: Summary
+    input_tokens: Summary
+    output_tokens: Summary
+    llm_calls: Summary
+    tool_calls: Summary
+    messages: Summary
+    cost_usd: Summary
+    cost_complete: bool
+    cost_total: float
+    cost_per_success: Optional[float]
+    wall_clock_s: Summary
+    agent_time_s: Summary
+    waiting_time_s: Summary
+    errors: Summary
+    per_agent: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: (v.to_dict() if isinstance(v, Summary) else v) for k, v in self.__dict__.items()}
+
+
+def summarize_efficiency(trajectories: Sequence[Trajectory], effs: Sequence[EfficiencyMetrics]) -> EfficiencySummary:
+    S = summarize
+    cost_complete = all(e.cost_complete for e in effs)
+    costs = [e.cost_usd or 0.0 for e in effs]
+    total_cost = sum(costs)
+    successes = sum(1 for t in trajectories if t.succeeded)
+    per_agent: Dict[str, Dict[str, Any]] = {}
+    agent_runs: Dict[str, int] = Counter()
+    roles: Dict[str, Optional[str]] = {}
+    acc: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    for e in effs:
+        for aid, ae in e.per_agent.items():
+            agent_runs[aid] += 1
+            roles[aid] = roles.get(aid) or ae.role
+            acc[aid]["tokens"].append(ae.total_tokens)
+            acc[aid]["input_tokens"].append(ae.input_tokens)
+            acc[aid]["output_tokens"].append(ae.output_tokens)
+            acc[aid]["cost_usd"].append(ae.cost_usd or 0.0)
+            acc[aid]["llm_calls"].append(ae.llm_calls)
+            acc[aid]["tool_calls"].append(ae.tool_calls)
+            acc[aid]["messages_sent"].append(ae.messages_sent)
+            acc[aid]["artifacts_produced"].append(ae.artifacts_produced)
+            acc[aid]["self_time_s"].append(ae.self_time_s)
+            acc[aid]["idle_time_s"].append(ae.idle_time_s)
+            acc[aid]["errors"].append(ae.errors)
+    n = max(1, len(effs))
+    total_tokens = sum(e.total_tokens for e in effs) or 1
+    for aid, d in acc.items():
+        per_agent[aid] = {k: mean(v) for k, v in d.items()}
+        per_agent[aid]["role"] = roles.get(aid)
+        per_agent[aid]["invocation_rate"] = agent_runs[aid] / n
+        per_agent[aid]["total_cost_usd"] = sum(d["cost_usd"])
+        per_agent[aid]["token_share"] = sum(d["tokens"]) / total_tokens
+    return EfficiencySummary(
+        tokens=S(e.total_tokens for e in effs), input_tokens=S(e.input_tokens for e in effs),
+        output_tokens=S(e.output_tokens for e in effs), llm_calls=S(e.llm_calls for e in effs),
+        tool_calls=S(e.tool_calls for e in effs), messages=S(e.messages for e in effs),
+        cost_usd=S(costs), cost_complete=cost_complete, cost_total=total_cost,
+        cost_per_success=(total_cost / successes) if successes else None,
+        wall_clock_s=S(e.wall_clock_s for e in effs), agent_time_s=S(e.agent_time_s for e in effs),
+        waiting_time_s=S(e.waiting_time_s for e in effs), errors=S(e.errors for e in effs), per_agent=per_agent)
+
+
+class EvaluationResult:
+    """Performance and efficiency of one swarm on one benchmark."""
+
+    def __init__(self, runs: RunSet, per_run: List[EfficiencyMetrics], performance: PerformanceMetrics,
+                 efficiency: EfficiencySummary) -> None:
+        self.runs = runs
+        self.per_run = per_run
+        self.performance = performance
+        self.efficiency = efficiency
+
+    @property
+    def label(self) -> str:
+        return self.runs.label
+
+    @property
+    def benchmark(self) -> str:
+        return self.runs.benchmark_name
+
+    @property
+    def success_rate(self) -> float:
+        return self.performance.success_rate
+
+    @property
+    def cost(self) -> Dict[str, Any]:
+        return {"total": self.efficiency.cost_total, "per_run": self.efficiency.cost_usd.mean,
+                "per_success": self.efficiency.cost_per_success, "complete": self.efficiency.cost_complete}
+
+    @property
+    def latency(self) -> Dict[str, float]:
+        return {"wall_clock": self.efficiency.wall_clock_s.mean, "agent_time": self.efficiency.agent_time_s.mean,
+                "waiting": self.efficiency.waiting_time_s.mean}
+
+    @property
+    def agents(self) -> List[str]:
+        return list(self.efficiency.per_agent.keys())
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "label": self.label, "benchmark": self.benchmark, "runs": len(self.runs),
+            "tasks": self.performance.n_tasks, "trials": self.performance.trials,
+            "success_rate": round(self.success_rate, 4),
+            "mean_score": round(self.performance.mean_score, 4),
+            "run_errors": self.performance.run_errors,
+            "cost": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in self.cost.items()},
+            "latency": {k: round(v, 3) for k, v in self.latency.items()},
+            "tokens_per_run": round(self.efficiency.tokens.mean, 1),
+            "agents": self.agents,
+        }
+
+    def to_dict(self, include_runs: bool = False) -> Dict[str, Any]:
+        d = {
+            "summary": self.summary(),
+            "performance": self.performance.to_dict(),
+            "efficiency": self.efficiency.to_dict(),
+            "per_run": [{"run_id": t.run_id, "task_id": t.task_id, "trial": t.trial, "status": t.status,
+                         "success": t.succeeded, "score": t.score, "cost_usd": e.cost_usd,
+                         "tokens": e.total_tokens, "llm_calls": e.llm_calls, "tool_calls": e.tool_calls,
+                         "wall_clock_s": e.wall_clock_s}
+                        for t, e in zip(self.runs.trajectories, self.per_run)],
+        }
+        if include_runs:
+            d["runs"] = self.runs.to_dict()
+        return d
+
+    def save(self, path: str, include_runs: bool = True) -> None:
+        with open(path, "w") as f:
+            json.dump(self.to_dict(include_runs=include_runs), f, indent=1, default=str)
+
+    @classmethod
+    def load(cls, path: str) -> "EvaluationResult":
+        with open(path) as f:
+            d = json.load(f)
+        if "runs" not in d:
+            raise ValueError("file has no trajectories; save with include_runs=True to reload")
+        return analyze_runs(RunSet.from_dict(d["runs"]))
+
+    def report(self, **kwargs: Any) -> str:
+        from .report.text import render_text
+        return render_text(self, **kwargs)
+
+    def __repr__(self) -> str:
+        return (f"EvaluationResult(label={self.label!r}, runs={len(self.runs)}, success={self.success_rate:.3f}, "
+                f"cost=${self.efficiency.cost_total:.2f})")
+
+
+def analyze_runs(runs: RunSet) -> EvaluationResult:
+    """Recompute the evaluation from trajectories (e.g. a saved RunSet)."""
+    per_run = [compute_efficiency(t) for t in runs.trajectories]
+    performance = compute_performance(runs.trajectories)
+    efficiency = summarize_efficiency(runs.trajectories, per_run)
+    return EvaluationResult(runs, per_run, performance, efficiency)
+
+
+def evaluate(swarm: Any, benchmark: Benchmark, trials: int = 1, seed: int = 0, evaluator: Any = None,
+             clock_factory: Optional[Callable[[], Clock]] = None, pricing: Optional[PricingTable] = None,
+             label: str = "baseline", progress: bool = False, raise_errors: bool = False,
+             on_run: Optional[Callable[[Trajectory], None]] = None) -> EvaluationResult:
+    """Run ``swarm`` on ``benchmark`` ``trials`` times and return an EvaluationResult.
+
+    ``swarm`` may be a Swarm instance, a ``factory() -> Swarm`` or a bare
+    ``run(task, ctx)`` function.
+    """
+    opts = RunOptions(trials=trials, seed=seed, clock_factory=clock_factory, pricing=pricing, evaluator=evaluator,
+                      progress=progress, raise_errors=raise_errors, on_run=on_run)
+    runs = SwarmRunner(swarm, benchmark, label=label, options=opts).run()
+    return analyze_runs(runs)
