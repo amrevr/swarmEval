@@ -7,7 +7,7 @@ SwarmEval evaluates a multi-agent system not only on whether it produced the rig
 This is **Phase 1** of the [roadmap](ROADMAP.md): observability and basic evaluation. Coordination analysis, causal ablation and optimization are later phases and are not in this release.
 
 ```
-Phase 1  Trajectory recorder · task format · metrics · report · JSON export · agent interface   ← this release
+Phase 1  Trajectory recorder · task format · metrics · report · run comparison · JSON/Parquet export · agent interface   ← this release
 Phase 2  Execution graph · utilization · communication · redundancy · critical path · swarm smells
 Phase 3  Ablation · failure injection · counterfactuals · confidence intervals
 Phase 4  Architecture recommendations · validated optimization
@@ -148,6 +148,25 @@ Repeated trials use seeds derived from `(seed, task, trial)` so a run set is rep
 * `RunSet.save/load`, `Trajectory.save/load` – trajectories are the source of truth; `swarmeval report runs.json` recomputes everything from them, and `--pricing prices.json` (or `analyze_runs(runs, pricing=...)`) re-prices every call from its recorded model and tokens.
 * `render_trajectory(traj)` – the event-by-event text trace.
 
+## Comparing runs
+
+`compare(baseline, candidate)` takes two `EvaluationResult`s (or `RunSet`s) and reports how the candidate differs:
+
+```python
+from swarmeval import compare, evaluate
+base = evaluate(flat_swarm, bench, trials=5, label="flat")
+cand = evaluate(hierarchical_swarm, bench, trials=5, label="hierarchical")
+cmp = compare(base, cand)          # pricing=PricingTable(...) prices both sides alike
+print(cmp.report())
+cmp.improved, cmp.regressed, cmp.is_tradeoff, cmp.flips["lost"]
+```
+
+* Both sides are re-analysed on the tasks they share; tasks present on only one side are listed and left out.
+* Every metric (success, score, crashes, cost per run / per success, tokens, calls, messages, wall clock, agent time, errors) gets its own baseline, candidate, delta and verdict (`improved` / `regressed` / `unchanged`), so a cheaper but less accurate candidate shows up as a **tradeoff** rather than one blended score.
+* Runs are paired by task and trial (same derived seed), giving fail→pass and pass→fail flips; per-task and per-agent rows show where the change happened, including agents that were added or removed.
+* A cost that is incomplete on either side is reported as unknown, never compared as $0.
+* Warnings flag different benchmarks or trial counts, mismatched seeds, and fewer than 3 trials. Differences are measured, not tested for significance (that is Phase 3).
+
 ## CLI
 
 ```bash
@@ -155,6 +174,7 @@ swarmeval demo [--trials N] [--out DIR] [--trace]
 swarmeval run    --swarm pkg.mod:factory --benchmark bench.json --trials 3 --out runs [--clock sim] [--pricing p.json] [--no-capture-text]
 swarmeval report runs/baseline.json [--trace N] [--pricing p.json]
 swarmeval export runs/baseline.json events.parquet [--format jsonl|parquet]
+swarmeval compare runs/flat.json runs/hierarchical.json [--pricing p.json] [--out cmp.json]
 ```
 
 ## Layout
@@ -166,7 +186,8 @@ swarmeval/
   runner.py        Swarm, SwarmRunner, RunSet, repeated trials, seeds
   evaluators.py    deterministic evaluators with JSON specs
   metrics/         performance, efficiency
-  report/          text report and trajectory trace
+  compare.py       run-to-run comparison
+  report/          text report, comparison report and trajectory trace
   export/          JSONL and Parquet events
   integrations/    Anthropic SDK adapter
   examples/        simulated research swarm + benchmark used by the demo and tests
@@ -178,7 +199,11 @@ tests/
 
 ## Development
 
+Develop and test inside a container rather than installing dependencies on your machine. Mount the checkout and run the tests:
+
 ```bash
-python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest -q
+docker run --rm -v "$PWD":/w -w /w python:3.12-slim \
+  sh -c 'pip install -q -e ".[dev,parquet]" && pytest -q'
 ```
+
+Swap the image tag (e.g. `python:3.9-slim`) to check the oldest supported Python. The Parquet tests skip when `pyarrow` is not installed.

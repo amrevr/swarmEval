@@ -126,7 +126,7 @@ Task = input, expected behaviour, success criteria, constraints, evaluator spec,
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| 1 Observability & evaluation | reproducible trace + evaluation report | **done** (`schema`, `recorder`, `runner`, `evaluators`, `metrics/performance`, `metrics/efficiency`, `report/text`, `export/jsonl`, `export/parquet`, `integrations/anthropic`, CLI incl. `export`); sync and async swarms. Not yet: run-to-run comparison (research.md §27) |
+| 1 Observability & evaluation | reproducible trace + evaluation report | **done** (`schema`, `recorder`, `runner`, `evaluators`, `metrics/performance`, `metrics/efficiency`, `report/text`, `export/jsonl`, `export/parquet`, `compare` (run-to-run comparison, research.md §27), `integrations/anthropic`, CLI incl. `export` and `compare`); sync and async swarms |
 | 2 Coordination analysis | explain where the swarm is inefficient and why | planned (`graph/`, `metrics/coordination`, `diagnostics/`) |
 | 3 Causal & research features | estimate which components actually matter | planned (`causal/`, confidence intervals in `stats`, `validity`) |
 | 4 Optimization | experimentally validated architecture improvements | planned (`optimize/`) |

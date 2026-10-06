@@ -105,6 +105,90 @@ def render_text(result: Any, show_agents: bool = True, show_tasks: bool = True) 
     return "\n".join(parts)
 
 
+def _fmt(x: Optional[float], unit: str) -> str:
+    if x is None:
+        return "unknown"
+    if unit == "pct":
+        return _pct(x)
+    if unit == "usd":
+        return _money(x)
+    if unit == "s":
+        return f"{x:.1f}s"
+    if unit == "int":
+        return f"{x:,.0f}"
+    return f"{x:.2f}"
+
+
+def _fmt_delta(m: Any) -> str:
+    d = m.delta
+    if d is None:
+        return "–"
+    if m.unit == "pct":
+        s = f"{d*100:+.1f} pts"
+    elif m.unit == "usd":
+        s = f"{'+' if d >= 0 else '-'}{_money(abs(d))}"
+    elif m.unit == "s":
+        s = f"{d:+.1f}s"
+    elif m.unit == "int":
+        s = f"{d:+,.0f}"
+    else:
+        s = f"{d:+.2f}"
+    rel = m.relative
+    return s + (f" ({rel*100:+.0f}%)" if rel is not None and m.unit != "pct" else "")
+
+
+_MARK = {"improved": "▲", "regressed": "▼", "unchanged": "=", "unknown": "?"}
+
+
+def render_comparison(cmp: Any, max_rows: int = 20) -> str:
+    """Side-by-side text report of a ``compare()`` result."""
+    b, c = cmp.baseline, cmp.candidate
+    lines = [f"COMPARISON  {b.label} → {c.label}  ·  {b.benchmark}  ·  {len(cmp.shared_tasks)} tasks, "
+             f"{cmp.paired_runs} paired runs", ""]
+    lines.append(f"  {'metric':<24}{b.label[:14]:>14}{c.label[:14]:>14}  {'change':<20}")
+    for m in cmp.metrics:
+        lines.append(f"  {m.label:<24}{_fmt(m.baseline, m.unit):>14}{_fmt(m.candidate, m.unit):>14}  "
+                     f"{_fmt_delta(m):<20}{_MARK[m.verdict]}")
+    lines.append("")
+    if cmp.is_tradeoff:
+        lines.append("  TRADEOFF  better: " + ", ".join(cmp.improved) + "  ·  worse: " + ", ".join(cmp.regressed))
+    elif cmp.improved:
+        lines.append("  better on: " + ", ".join(cmp.improved) + "  (no regressions)")
+    elif cmp.regressed:
+        lines.append("  worse on: " + ", ".join(cmp.regressed) + "  (no improvements)")
+    else:
+        lines.append("  no measurable difference")
+    gained, lost = cmp.flips["gained"], cmp.flips["lost"]
+    lines.append(f"  paired outcomes: {len(gained)} fail→pass, {len(lost)} pass→fail "
+                 f"(of {cmp.paired_runs} runs with the same task and trial)")
+
+    changed = [(tid, t) for tid, t in cmp.per_task.items() if t["success_rate"][0] != t["success_rate"][1]]
+    if changed:
+        lines += ["", "TASKS WITH CHANGED SUCCESS"]
+        lines.append(f"  {'task':<16}{'success':>18}{'cost':>22}")
+        for tid, t in changed[:max_rows]:
+            (sb, sc), (cb, cc) = t["success_rate"], t["cost_usd"]
+            lines.append(f"  {tid:<16}{_pct(sb):>8} → {_pct(sc):<7}{_money(cb):>10} → {_money(cc):<9}")
+        if len(changed) > max_rows:
+            lines.append(f"  … {len(changed) - max_rows} more")
+
+    if cmp.per_agent:
+        lines += ["", "AGENTS (per run, mean)"]
+        lines.append(f"  {'agent':<16}{'status':<9}{'tokens':>24}{'cost':>24}")
+        for aid, a in list(cmp.per_agent.items())[:max_rows]:
+            tb, tc = a["tokens"]
+            cb, cc = a["cost_usd"]
+            tok = f"{'-' if tb is None else f'{tb:,.0f}'} → {'-' if tc is None else f'{tc:,.0f}'}"
+            cost = f"{_money(cb) if a['status'] != 'added' else '-'} → {_money(cc) if a['status'] != 'removed' else '-'}"
+            lines.append(f"  {aid:<16}{a['status']:<9}{tok:>24}{cost:>24}")
+
+    if cmp.warnings:
+        lines.append("")
+        lines += [f"  ! {w}" for w in cmp.warnings]
+    lines += ["", "  Differences are measured, not tested for significance (Phase 3)."]
+    return "\n".join(lines)
+
+
 def render_trajectory(traj: Trajectory, max_events: int = 200) -> str:
     """Plain-text listing of one trajectory: what happened, in order."""
     t0 = traj.started_at or (traj.events[0].timestamp if traj.events else 0.0)

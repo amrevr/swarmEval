@@ -1,7 +1,8 @@
 """SwarmEval -- evaluation and observability for multi-agent AI systems.
 
 Phase 1 (this release): trajectory recording, standardized task format,
-basic performance/efficiency metrics, text reports and JSON/JSONL export.
+basic performance/efficiency metrics, run comparison, text reports and
+JSON/JSONL/Parquet export.
 
 Quick start::
 
@@ -16,7 +17,8 @@ from .runner import FunctionSwarm, RunOptions, RunSet, Swarm, SwarmRunner
 from .schema import Artifact, Benchmark, Evaluation, Event, EventType, Span, Task, Trajectory
 from .metrics import EfficiencyMetrics, PerformanceMetrics, compute_efficiency, compute_performance
 from .export import read_events_jsonl, write_events_jsonl
-from .report import render_text, render_trajectory
+from .report import render_comparison, render_text, render_trajectory
+from .compare import Comparison, compare
 
 __version__ = "0.1.0"
 
@@ -26,6 +28,7 @@ __all__ = [
     "RunContext", "AgentSpan", "Message", "LLMResult", "LLMCall", "ToolCall", "SimClock", "WallClock",
     "Swarm", "FunctionSwarm", "SwarmRunner", "RunOptions", "RunSet",
     "PerformanceMetrics", "EfficiencyMetrics", "compute_performance", "compute_efficiency",
-    "read_events_jsonl", "write_events_jsonl", "render_text", "render_trajectory",
+    "read_events_jsonl", "write_events_jsonl", "render_text", "render_trajectory", "render_comparison",
+    "compare", "Comparison",
     "evaluators", "__version__",
 ]

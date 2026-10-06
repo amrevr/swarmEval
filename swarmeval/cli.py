@@ -4,6 +4,7 @@
     swarmeval run --swarm pkg.module:swarm --benchmark bench.json [--trials N] [--out DIR]
     swarmeval report runs/baseline.json [--trace N] [--pricing prices.json]
     swarmeval export runs/baseline.json events.parquet [--format jsonl|parquet]
+    swarmeval compare runs/baseline.json runs/candidate.json [--pricing prices.json] [--out cmp.json]
 """
 from __future__ import annotations
 
@@ -97,6 +98,21 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compare(args: argparse.Namespace) -> int:
+    from .compare import compare
+    base, cand = _load_runs_or_exit(args.baseline), _load_runs_or_exit(args.candidate)
+    pricing = PricingTable.load(args.pricing) if args.pricing else None
+    try:
+        cmp = compare(base, cand, pricing=pricing)
+    except ValueError as exc:
+        raise SystemExit(f"swarmeval: {exc}")
+    print(cmp.report())
+    if args.out:
+        cmp.save(args.out)
+        print(f"\nwrote {args.out}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     runs = _load_runs_or_exit(args.path)
     n = export_events(runs.trajectories, args.out, args.format or "")
@@ -140,6 +156,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ex.add_argument("--format", choices=["jsonl", "parquet"], default=None,
                     help="default: inferred from the output extension")
     ex.set_defaults(fn=cmd_export)
+
+    cp = sub.add_parser("compare", help="compare a candidate run set against a baseline")
+    cp.add_argument("baseline", help="saved RunSet or EvaluationResult JSON")
+    cp.add_argument("candidate", help="saved RunSet or EvaluationResult JSON")
+    cp.add_argument("--pricing", default=None, help="price both sides with this JSON pricing table")
+    cp.add_argument("--out", default=None, help="also write the comparison as JSON")
+    cp.set_defaults(fn=cmd_compare)
 
     args = p.parse_args(argv)
     return args.fn(args)
