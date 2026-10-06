@@ -65,5 +65,5 @@ def test_callable_and_unknown_spec():
 def test_task_spec_serialises_evaluator_instances():
     t = Task("t", "q", evaluator=E.Regex("done"))
     d = t.to_dict()
-    assert d["evaluator"] == {"type": "regex", "pattern": "done"}
+    assert d["evaluator"] == {"type": "regex", "pattern": "done", "flags": E.Regex.DEFAULT_FLAGS}
     assert E.from_spec(Task.from_dict(d).evaluator).evaluate(t, "done").success

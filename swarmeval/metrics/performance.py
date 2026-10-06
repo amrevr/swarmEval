@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..schema import Trajectory
 from ..stats import mean
@@ -33,7 +33,11 @@ class PerformanceMetrics:
         }
 
 
-def compute_performance(trajectories: Sequence[Trajectory]) -> PerformanceMetrics:
+def compute_performance(trajectories: Sequence[Trajectory],
+                        per_run: Optional[Sequence[Any]] = None) -> PerformanceMetrics:
+    """Task performance over a set of runs.  ``per_run`` (the runs'
+    ``EfficiencyMetrics``, same order) supplies per-task cost; without it the
+    cost recorded on each trajectory is used."""
     pm = PerformanceMetrics()
     pm.n_runs = len(trajectories)
     if not trajectories:
@@ -46,17 +50,25 @@ def compute_performance(trajectories: Sequence[Trajectory]) -> PerformanceMetric
     if cons:
         pm.constraint_pass_rate = sum(1 for c in cons if c) / len(cons)
     pm.run_errors = sum(1 for t in trajectories if t.status != "success")
+    if per_run is not None:
+        costs = [(e.cost_usd, e.cost_complete) for e in per_run]
+    else:
+        costs = [(t.cost_usd, t.cost_is_complete) for t in trajectories]
     by_task: Dict[str, List[Trajectory]] = defaultdict(list)
+    task_costs: Dict[str, List[Tuple[Optional[float], bool]]] = defaultdict(list)
     by_trial: Dict[int, List[bool]] = defaultdict(list)
-    for t in trajectories:
+    for t, c in zip(trajectories, costs):
         by_task[t.task_id].append(t)
+        task_costs[t.task_id].append(c)
         by_trial[t.trial].append(t.succeeded)
     pm.n_tasks = len(by_task)
     pm.trials = max(by_trial) + 1 if by_trial else 0
     for tid, ts in by_task.items():
+        known = [c for c, _ in task_costs[tid] if c is not None]
         pm.per_task[tid] = {"success_rate": mean([1.0 if x.succeeded else 0.0 for x in ts]),
                             "score": mean([x.score for x in ts]), "n": len(ts),
-                            "cost_usd": mean([x.cost_usd or 0.0 for x in ts]),
+                            "cost_usd": mean(known) if known else None,
+                            "cost_complete": all(ok for _, ok in task_costs[tid]),
                             "latency_s": mean([x.duration for x in ts]),
                             "category": ts[0].task.category, "difficulty": ts[0].task.difficulty}
     pm.per_trial = [mean([1.0 if s else 0.0 for s in by_trial[i]]) for i in sorted(by_trial)]

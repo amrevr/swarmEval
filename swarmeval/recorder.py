@@ -9,7 +9,7 @@ Typical use inside a swarm::
 
     def run(self, task, ctx):
         with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
-            plan = coord.llm(call_model, prompt, prompt=prompt)
+            plan = coord.llm(call_model, prompt)
             coord.send("researcher", plan, kind="task_assignment")
         with ctx.agent("researcher", role="research") as r:
             for msg in r.receive():
@@ -17,10 +17,14 @@ Typical use inside a swarm::
                 r.produce("notes", notes)
         ...
         return answer
+
+Async swarms use ``async with ctx.agent(...)``, ``await span.allm(...)``,
+``await span.acall_tool(...)`` and ``await ctx.gather(...)``.
 """
 from __future__ import annotations
 
 import contextvars
+import inspect
 import random
 import threading
 import time
@@ -28,10 +32,10 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from .pricing import DEFAULT_PRICING, PricingTable
-from .schema import (Artifact, Event, EventType, Span, Status, Task, Trajectory,
+from .schema import (Artifact, Event, EventType, Span, Status, Task, TextPolicy, Trajectory,
                      content_hash, estimate_tokens, new_id, preview, to_text)
 
 
@@ -45,6 +49,13 @@ class Clock:
     def sleep(self, seconds: float) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
+    def fork(self) -> None:
+        """Called at the start of a concurrent branch (inside its context)."""
+
+    def join(self, end: float) -> None:
+        """Called in the parent after its branches finish; ``end`` is the
+        latest branch end time."""
+
 
 class WallClock(Clock):
     def now(self) -> float:
@@ -57,25 +68,46 @@ class WallClock(Clock):
 
 class SimClock(Clock):
     """A virtual clock.  Simulated swarms advance it explicitly so that
-    demos and tests run instantly while still producing realistic timings."""
+    demos and tests run instantly while still producing realistic timings.
+
+    Concurrent branches started with ``ctx.parallel`` / ``ctx.gather`` each
+    get their own timeline (held in a context variable), and the parent
+    resumes at the latest branch end -- so simulated parallel work overlaps
+    instead of adding up."""
 
     def __init__(self, start: float = 0.0) -> None:
         self._t = float(start)
         self._lock = threading.Lock()
+        self._branch: contextvars.ContextVar = contextvars.ContextVar(f"simclock_{id(self)}", default=None)
 
     def now(self) -> float:
-        return self._t
+        box = self._branch.get()
+        return box[0] if box is not None else self._t
 
     def sleep(self, seconds: float) -> None:
         self.advance(seconds)
 
     def advance(self, seconds: float) -> None:
+        box = self._branch.get()
+        if box is not None:
+            box[0] += max(0.0, float(seconds))
+            return
         with self._lock:
             self._t += max(0.0, float(seconds))
 
     def set(self, t: float) -> None:
+        box = self._branch.get()
+        if box is not None:
+            box[0] = float(t)
+            return
         with self._lock:
             self._t = float(t)
+
+    def fork(self) -> None:
+        self._branch.set([self.now()])
+
+    def join(self, end: float) -> None:
+        self.set(max(self.now(), end))
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +136,8 @@ class LLMResult:
     output_tokens: int = 0
     model: Optional[str] = None
     raw: Any = None
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 class LLMCall:
@@ -114,6 +148,8 @@ class LLMCall:
         self.model = model
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
         self.input_artifacts = input_artifacts
         self.prompt = prompt
         self.output: Any = None
@@ -132,10 +168,38 @@ class ToolCall:
 
 
 _current_span: contextvars.ContextVar = contextvars.ContextVar("swarmeval_current_span", default=None)
+# The LLM call being recorded right now, so client instrumentation can fill
+# it in instead of recording the same API call a second time.
+_current_llm_call: contextvars.ContextVar = contextvars.ContextVar("swarmeval_current_llm_call", default=None)
 
 
 def _ids(artifacts: Iterable[Union[Artifact, str]]) -> List[str]:
     return [a.artifact_id if isinstance(a, Artifact) else str(a) for a in artifacts]
+
+
+def _reject_awaitable(result: Any, sync_name: str, async_name: str) -> None:
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()  # avoid a "never awaited" warning; the error says what to do
+        raise TypeError(f"{sync_name}() got an awaitable from an async function; "
+                        f"use `await span.{async_name}(...)` instead")
+
+
+def _call_record(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+    """How a function's arguments are recorded (prompt or tool args)."""
+    if len(args) == 1 and not kwargs:
+        return args[0]
+    if args:
+        return {"args": list(args), **kwargs}
+    return dict(kwargs) if kwargs else None
+
+
+def _takes_positional(fn: Callable[..., Any]) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL) for p in params)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,15 +217,32 @@ class RunContext:
         self.pricing = pricing or DEFAULT_PRICING
         self.seed = seed
         self.trial = trial
-        self.rng = random.Random(seed)
-        self.capture_text = capture_text
-        self.max_text_chars = max_text_chars
+        self._rng = random.Random(seed)
+        self._branch_rng: contextvars.ContextVar = contextvars.ContextVar(f"swarmeval_rng_{id(self)}", default=None)
+        self.text_policy = TextPolicy(capture_text, max_text_chars)
         self.trajectory = Trajectory(run_id=run_id or new_id("run"), task_id=task.task_id, task=task,
                                      seed=seed, trial=trial)
+        self.trajectory.metadata.update(self.text_policy.to_metadata())
         self._lock = threading.RLock()
         self._mailbox: Dict[str, List[Message]] = {}
+        self._error_origin: Dict[int, Tuple[BaseException, str]] = {}
         self._started = False
         self._finished = False
+
+    @property
+    def capture_text(self) -> bool:
+        return self.text_policy.capture
+
+    @property
+    def max_text_chars(self) -> int:
+        return self.text_policy.max_chars
+
+    @property
+    def rng(self) -> random.Random:
+        """Seeded randomness.  Each ``parallel``/``gather`` branch gets its own
+        generator derived from its parent, so draws do not depend on thread
+        scheduling."""
+        return self._branch_rng.get() or self._rng
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -190,8 +271,11 @@ class RunContext:
         return self.clock.now()
 
     # -- recording ------------------------------------------------------------
-    def record(self, event_type: Union[EventType, str], **fields: Any) -> Event:
-        span = _current_span.get()
+    def record(self, event_type: Union[EventType, str], _span: Optional["AgentSpan"] = None,
+               **fields: Any) -> Event:
+        """Append an event.  Agent and span come from ``_span`` when given (the
+        span whose method is recording), else from the active span."""
+        span = _span if _span is not None else _current_span.get()
         et = event_type.value if isinstance(event_type, EventType) else event_type
         fields.setdefault("timestamp", self.now())
         if span is not None:
@@ -205,14 +289,33 @@ class RunContext:
         return ev
 
     def annotate(self, note: str, **metadata: Any) -> Event:
-        return self.record(EventType.ANNOTATION, content=note, metadata=metadata)
+        return self.record(EventType.ANNOTATION, content=self._text(note), metadata=metadata)
 
     def _text(self, obj: Any) -> Any:
-        if not self.capture_text:
-            return preview(obj, 120)
-        if isinstance(obj, str) and len(obj) > self.max_text_chars:
-            return obj[: self.max_text_chars] + "…[truncated]"
-        return obj
+        return self.text_policy.apply(obj)
+
+    # -- exceptions -----------------------------------------------------------
+    def _mark_exception(self, exc: BaseException, event_id: str) -> None:
+        with self._lock:
+            self._error_origin.setdefault(id(exc), (exc, event_id))
+
+    def record_exception(self, exc: BaseException, _span: Optional["AgentSpan"] = None) -> Event:
+        """Record an ERROR for ``exc``.  The first record of an exception counts
+        as the error; later ones (the same exception leaving enclosing spans
+        or the run) are marked ``propagated`` and point to the original, so
+        one failure is counted once regardless of nesting depth."""
+        err = f"{type(exc).__name__}: {exc}"
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
+        with self._lock:
+            origin = self._error_origin.get(id(exc))
+        meta: Dict[str, Any] = {}
+        if origin is not None and origin[0] is exc:
+            meta = {"propagated": True, "origin_event_id": origin[1]}
+        ev = self.record(EventType.ERROR, _span=_span, error=err,
+                         content=self._text(tb) if self.capture_text else None, metadata=meta)
+        if not meta:
+            self._mark_exception(exc, ev.event_id)
+        return ev
 
     # -- spans ----------------------------------------------------------------
     def agent(self, agent_id: str, role: Optional[str] = None, model: Optional[str] = None,
@@ -225,13 +328,14 @@ class RunContext:
 
     # -- messaging ------------------------------------------------------------
     def send(self, sender: str, receiver: str, content: Any, kind: str = "information",
-             artifacts: Iterable[Union[Artifact, str]] = (), **metadata: Any) -> Message:
+             artifacts: Iterable[Union[Artifact, str]] = (), _span: Optional["AgentSpan"] = None,
+             **metadata: Any) -> Message:
         """Record a message and deliver it to the receiver's mailbox."""
         art_ids = _ids(artifacts)
         tokens = estimate_tokens(content) + sum(
             self.trajectory.artifacts[a].tokens for a in art_ids if a in self.trajectory.artifacts)
-        span = _current_span.get()
-        ev = self.record(EventType.MESSAGE, agent_id=sender, span_id=span.span_id if span else None,
+        span = _span if _span is not None else _current_span.get()
+        ev = self.record(EventType.MESSAGE, _span=span, agent_id=sender, span_id=span.span_id if span else None,
                          sender=sender, receiver=receiver, kind=kind, content=self._text(content),
                          content_tokens=tokens, content_hash=content_hash(content),
                          input_artifacts=art_ids, metadata=dict(metadata))
@@ -252,27 +356,72 @@ class RunContext:
         with self._lock:
             return list(self._mailbox.get(agent_id, []))
 
-    # -- parallel helper ------------------------------------------------------
+    # -- concurrency ----------------------------------------------------------
+    def _branch_seeds(self, n: int) -> List[int]:
+        rng = self.rng
+        return [rng.getrandbits(64) for _ in range(n)]
+
+    def _enter_branch(self, seed: int) -> None:
+        self.clock.fork()
+        self._branch_rng.set(random.Random(seed))
+
     def parallel(self, *fns: Callable[[], Any], max_workers: Optional[int] = None) -> List[Any]:
-        """Run callables concurrently in threads, propagating the current span
-        so nested ``ctx.agent`` calls are parented correctly."""
+        """Run callables concurrently in threads.  Each branch inherits the
+        current span (so nested ``ctx.agent`` calls are parented correctly),
+        gets its own timeline on a ``SimClock`` and its own seeded ``ctx.rng``;
+        the parent resumes when the last branch ends."""
         if not fns:
             return []
+        seeds = self._branch_seeds(len(fns))
+        ends = [self.now()] * len(fns)
+
+        def branch(i: int, fn: Callable[[], Any]) -> Any:
+            self._enter_branch(seeds[i])
+            try:
+                return fn()
+            finally:
+                ends[i] = self.now()
+
         contexts = [contextvars.copy_context() for _ in fns]
-        with ThreadPoolExecutor(max_workers=max_workers or len(fns)) as ex:
-            futures = [ex.submit(c.run, fn) for c, fn in zip(contexts, fns)]
-            return [f.result() for f in futures]
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers or len(fns)) as ex:
+                futures = [ex.submit(c.run, branch, i, fn) for i, (c, fn) in enumerate(zip(contexts, fns))]
+                return [f.result() for f in futures]
+        finally:
+            self.clock.join(max(ends))
+
+    async def gather(self, *aws: Awaitable[Any]) -> List[Any]:
+        """``asyncio.gather`` for agent coroutines, with the same per-branch
+        timeline and randomness as ``parallel``."""
+        import asyncio
+        if not aws:
+            return []
+        seeds = self._branch_seeds(len(aws))
+        ends = [self.now()] * len(aws)
+
+        async def branch(i: int, aw: Awaitable[Any]) -> Any:
+            self._enter_branch(seeds[i])
+            try:
+                return await aw
+            finally:
+                ends[i] = self.now()
+
+        try:
+            return list(await asyncio.gather(*(branch(i, aw) for i, aw in enumerate(aws))))
+        finally:
+            self.clock.join(max(ends))
 
     # -- cost -----------------------------------------------------------------
-    def cost_of(self, model: Optional[str], input_tokens: int, output_tokens: int) -> Optional[float]:
-        return self.pricing.cost(model, input_tokens, output_tokens)
+    def cost_of(self, model: Optional[str], input_tokens: int, output_tokens: int,
+                cache_read_tokens: int = 0, cache_write_tokens: int = 0) -> Optional[float]:
+        return self.pricing.cost(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
 
 
 # --------------------------------------------------------------------------- #
 # Agent span
 # --------------------------------------------------------------------------- #
 class AgentSpan:
-    """Context manager for one agent invocation."""
+    """Context manager (sync or async) for one agent invocation."""
 
     def __init__(self, ctx: RunContext, agent_id: str, role: Optional[str], model: Optional[str],
                  metadata: Dict[str, Any]) -> None:
@@ -310,13 +459,17 @@ class AgentSpan:
         if self._closed:
             return False
         if exc is not None:
-            err = f"{type(exc).__name__}: {exc}"
-            self.ctx.record(EventType.ERROR, error=err, content=traceback.format_exc()[-2000:]
-                            if self.ctx.capture_text else None)
-            self._close(Status.ERROR.value, err)
+            self.ctx.record_exception(exc, _span=self)
+            self._close(Status.ERROR.value, f"{type(exc).__name__}: {exc}")
         else:
             self._close(Status.SUCCESS.value, None)
         return False
+
+    async def __aenter__(self) -> "AgentSpan":
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return self.__exit__(exc_type, exc, tb)
 
     def _close(self, status: str, error: Optional[str]) -> None:
         if self._closed:
@@ -348,11 +501,15 @@ class AgentSpan:
         call = LLMCall(model or self.model, input_tokens, output_tokens, _ids(input_artifacts), prompt)
         call.metadata.update(metadata)
         t0 = ctx.now()
+        token = _current_llm_call.set(call)
         try:
             yield call
         except Exception as exc:
-            self._record_llm(call, t0, Status.ERROR.value, f"{type(exc).__name__}: {exc}")
+            ev = self._record_llm(call, t0, Status.ERROR.value, f"{type(exc).__name__}: {exc}")
+            ctx._mark_exception(exc, ev.event_id)
             raise
+        finally:
+            _current_llm_call.reset(token)
         self._record_llm(call, t0, Status.SUCCESS.value, None)
 
     def _record_llm(self, call: LLMCall, t0: float, status: str, error: Optional[str]) -> Event:
@@ -362,45 +519,80 @@ class AgentSpan:
         if call.prompt is not None:
             meta["prompt"] = ctx._text(to_text(call.prompt))
             meta["prompt_hash"] = content_hash(call.prompt)
-        return ctx.record(EventType.LLM_CALL, model=call.model, input_tokens=int(call.input_tokens),
-                          output_tokens=int(call.output_tokens),
-                          cost_usd=ctx.cost_of(call.model, int(call.input_tokens), int(call.output_tokens)),
+        tin, tout = int(call.input_tokens), int(call.output_tokens)
+        cr, cw = int(call.cache_read_tokens), int(call.cache_write_tokens)
+        return ctx.record(EventType.LLM_CALL, _span=self, model=call.model, input_tokens=tin, output_tokens=tout,
+                          cache_read_tokens=cr, cache_write_tokens=cw,
+                          cost_usd=ctx.cost_of(call.model, tin, tout, cr, cw),
                           latency_ms=(end - t0) * 1000.0, status=status, error=error,
                           content=ctx._text(call.output) if call.output is not None else None,
                           content_tokens=estimate_tokens(call.output) if call.output is not None else 0,
                           content_hash=content_hash(call.output) if call.output is not None else None,
                           input_artifacts=list(call.input_artifacts), metadata=meta, timestamp=t0)
 
+    @staticmethod
+    def _llm_args(fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any],
+                  prompt: Any) -> Tuple[Tuple[Any, ...], Any]:
+        """Arguments for ``fn`` and the prompt to record.  ``prompt=`` alone is
+        passed to ``fn`` when it takes a positional argument, and without
+        ``prompt=`` the arguments themselves are recorded as the prompt."""
+        if prompt is not None and not args and not kwargs and _takes_positional(fn):
+            args = (prompt,)
+        return args, prompt if prompt is not None else _call_record(args, kwargs)
+
+    @staticmethod
+    def _finish_llm(call: LLMCall, result: Any, input_tokens: Optional[int],
+                    output_tokens: Optional[int]) -> Any:
+        instrumented = bool(call.metadata.get("api_calls"))  # usage already filled by instrument_client
+        if isinstance(result, LLMResult):
+            if not instrumented:
+                call.input_tokens = result.input_tokens
+                call.output_tokens = result.output_tokens
+                call.cache_read_tokens = result.cache_read_tokens
+                call.cache_write_tokens = result.cache_write_tokens
+                if result.model:
+                    call.model = result.model
+            out = result.text
+        else:
+            out = result
+        call.output = out
+        if input_tokens is not None:
+            call.input_tokens = input_tokens
+        if output_tokens is not None:
+            call.output_tokens = output_tokens
+        if not call.input_tokens and not call.cache_read_tokens and call.prompt is not None:
+            call.input_tokens = estimate_tokens(call.prompt)
+            call.metadata["input_tokens_estimated"] = True
+        if not call.output_tokens and out is not None:
+            call.output_tokens = estimate_tokens(out)
+            call.metadata["output_tokens_estimated"] = True
+        return out
+
     def llm(self, fn: Callable[..., Any], *args: Any, model: Optional[str] = None,
             input_artifacts: Iterable[Union[Artifact, str]] = (), prompt: Any = None,
             input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
             **kwargs: Any) -> Any:
-        """Managed LLM call: runs ``fn`` and records it.  If ``fn`` returns an
-        ``LLMResult`` its token usage is recorded and ``result.text`` returned.
-        Otherwise token counts fall back to a character-based estimate."""
-        with self.llm_call(model=model, input_artifacts=input_artifacts, prompt=prompt) as call:
+        """Managed LLM call: runs ``fn(*args, **kwargs)`` and records it.  If
+        ``fn`` returns an ``LLMResult`` its token usage is recorded and
+        ``result.text`` returned; otherwise token counts are estimated from the
+        prompt (``prompt=``, or ``fn``'s arguments) and the output."""
+        args, recorded = self._llm_args(fn, args, kwargs, prompt)
+        with self.llm_call(model=model, input_artifacts=input_artifacts, prompt=recorded) as call:
             result = fn(*args, **kwargs)
-            if isinstance(result, LLMResult):
-                call.input_tokens = result.input_tokens
-                call.output_tokens = result.output_tokens
-                if result.model:
-                    call.model = result.model
-                call.output = result.text
-                out = result.text
-            else:
-                call.output = result
-                out = result
-            if input_tokens is not None:
-                call.input_tokens = input_tokens
-            if output_tokens is not None:
-                call.output_tokens = output_tokens
-            if not call.input_tokens and prompt is not None:
-                call.input_tokens = estimate_tokens(prompt)
-                call.metadata["input_tokens_estimated"] = True
-            if not call.output_tokens and out is not None:
-                call.output_tokens = estimate_tokens(out)
-                call.metadata["output_tokens_estimated"] = True
-        return out
+            _reject_awaitable(result, "llm", "allm")
+            return self._finish_llm(call, result, input_tokens, output_tokens)
+
+    async def allm(self, fn: Callable[..., Any], *args: Any, model: Optional[str] = None,
+                   input_artifacts: Iterable[Union[Artifact, str]] = (), prompt: Any = None,
+                   input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
+                   **kwargs: Any) -> Any:
+        """Async ``llm``: awaits ``fn(*args, **kwargs)`` so latency and usage are real."""
+        args, recorded = self._llm_args(fn, args, kwargs, prompt)
+        with self.llm_call(model=model, input_artifacts=input_artifacts, prompt=recorded) as call:
+            result = fn(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return self._finish_llm(call, result, input_tokens, output_tokens)
 
     # -- tool calls -----------------------------------------------------------
     @contextmanager
@@ -412,14 +604,15 @@ class AgentSpan:
         try:
             yield call
         except Exception as exc:
-            self._record_tool(call, t0, Status.ERROR.value, f"{type(exc).__name__}: {exc}")
+            ev = self._record_tool(call, t0, Status.ERROR.value, f"{type(exc).__name__}: {exc}")
+            ctx._mark_exception(exc, ev.event_id)
             raise
         self._record_tool(call, t0, Status.SUCCESS.value, None)
 
     def _record_tool(self, call: ToolCall, t0: float, status: str, error: Optional[str]) -> Event:
         ctx = self.ctx
         end = ctx.now()
-        return ctx.record(EventType.TOOL_CALL, tool_name=call.name, tool_args=call.args,
+        return ctx.record(EventType.TOOL_CALL, _span=self, tool_name=call.name, tool_args=ctx._text(call.args),
                           latency_ms=(end - t0) * 1000.0, status=status, error=error,
                           content=ctx._text(call.result) if call.result is not None else None,
                           content_tokens=estimate_tokens(call.result) if call.result is not None else 0,
@@ -431,13 +624,27 @@ class AgentSpan:
         """Managed tool call: runs ``fn(*args, **kwargs)`` and records it."""
         recorded_args: Any = {"args": list(args), **kwargs} if args else dict(kwargs)
         with self.tool_call(name, recorded_args, input_artifacts=input_artifacts) as call:
-            call.result = fn(*args, **kwargs)
-            return call.result
+            result = fn(*args, **kwargs)
+            _reject_awaitable(result, "call_tool", "acall_tool")
+            call.result = result
+            return result
+
+    async def acall_tool(self, name: str, fn: Callable[..., Any], *args: Any,
+                         input_artifacts: Iterable[Union[Artifact, str]] = (), **kwargs: Any) -> Any:
+        """Async ``call_tool``: awaits ``fn(*args, **kwargs)``."""
+        recorded_args: Any = {"args": list(args), **kwargs} if args else dict(kwargs)
+        with self.tool_call(name, recorded_args, input_artifacts=input_artifacts) as call:
+            result = fn(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            call.result = result
+            return result
 
     # -- messaging ------------------------------------------------------------
     def send(self, receiver: str, content: Any, kind: str = "information",
              artifacts: Iterable[Union[Artifact, str]] = (), **metadata: Any) -> Message:
-        return self.ctx.send(self.agent_id, receiver, content, kind=kind, artifacts=artifacts, **metadata)
+        return self.ctx.send(self.agent_id, receiver, content, kind=kind, artifacts=artifacts, _span=self,
+                             **metadata)
 
     def receive(self) -> List[Message]:
         return self.ctx.receive(self.agent_id)
@@ -450,9 +657,9 @@ class AgentSpan:
         ctx = self.ctx
         art = Artifact(new_id("art"), name, self.agent_id, self.span_id, ctx.now(), content,
                        content_hash(content), estimate_tokens(content), None, dict(metadata))
-        ev = ctx.record(EventType.ARTIFACT, kind=name, content=ctx._text(content), content_tokens=art.tokens,
-                        content_hash=art.content_hash, output_artifacts=[art.artifact_id],
-                        metadata=dict(metadata))
+        ev = ctx.record(EventType.ARTIFACT, _span=self, kind=name, content=ctx._text(content),
+                        content_tokens=art.tokens, content_hash=art.content_hash,
+                        output_artifacts=[art.artifact_id], metadata=dict(metadata))
         art.event_id = ev.event_id
         with ctx._lock:
             ctx.trajectory.artifacts[art.artifact_id] = art
@@ -461,15 +668,16 @@ class AgentSpan:
     def consume(self, artifact: Union[Artifact, str], purpose: Optional[str] = None) -> Optional[Artifact]:
         art_id = artifact.artifact_id if isinstance(artifact, Artifact) else str(artifact)
         art = self.ctx.trajectory.artifacts.get(art_id)
-        self.ctx.record(EventType.ARTIFACT_USE, kind=art.name if art else None, input_artifacts=[art_id],
-                        metadata={"purpose": purpose} if purpose else {})
+        self.ctx.record(EventType.ARTIFACT_USE, _span=self, kind=art.name if art else None,
+                        input_artifacts=[art_id], metadata={"purpose": purpose} if purpose else {})
         return art
 
     # -- waiting --------------------------------------------------------------
     def wait(self, reason: str, seconds: float) -> None:
         t0 = self.ctx.now()
         self.ctx.clock.sleep(seconds)
-        self.ctx.record(EventType.WAIT, kind=reason, latency_ms=(self.ctx.now() - t0) * 1000.0, timestamp=t0)
+        self.ctx.record(EventType.WAIT, _span=self, kind=reason,
+                        latency_ms=(self.ctx.now() - t0) * 1000.0, timestamp=t0)
 
     @contextmanager
     def waiting(self, reason: str) -> Iterator[None]:
@@ -477,14 +685,15 @@ class AgentSpan:
         try:
             yield
         finally:
-            self.ctx.record(EventType.WAIT, kind=reason, latency_ms=(self.ctx.now() - t0) * 1000.0, timestamp=t0)
+            self.ctx.record(EventType.WAIT, _span=self, kind=reason,
+                            latency_ms=(self.ctx.now() - t0) * 1000.0, timestamp=t0)
 
     # -- misc -----------------------------------------------------------------
     def note(self, text: str, **metadata: Any) -> Event:
-        return self.ctx.record(EventType.ANNOTATION, content=text, metadata=metadata)
+        return self.ctx.record(EventType.ANNOTATION, _span=self, content=self.ctx._text(text), metadata=metadata)
 
     def error(self, message: str, **metadata: Any) -> Event:
-        return self.ctx.record(EventType.ERROR, error=message, metadata=metadata)
+        return self.ctx.record(EventType.ERROR, _span=self, error=message, metadata=metadata)
 
     def sub_agent(self, agent_id: str, role: Optional[str] = None, model: Optional[str] = None,
                   **metadata: Any) -> "AgentSpan":

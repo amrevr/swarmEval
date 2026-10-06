@@ -101,19 +101,21 @@ result.save("runs/qa.json")
 
 | Call | Records |
 |---|---|
-| `ctx.agent(id, role, model)` | an agent invocation span (nest them for hierarchies; `ctx.parallel(...)` for threads) |
-| `span.llm(fn, …)` / `span.llm_call(...)` | an LLM call with model, tokens, cost, latency, prompt, `input_artifacts` |
+| `ctx.agent(id, role, model)` | an agent invocation span (nest them for hierarchies; `async with` works too) |
+| `ctx.parallel(*fns)` / `await ctx.gather(*coros)` | concurrent branches: each gets its own `SimClock` timeline and seeded `ctx.rng`, and the parent resumes at the latest branch end |
+| `span.llm(fn, …)` / `span.llm_call(...)` | an LLM call with model, tokens (incl. prompt-cache reads/writes), cost, latency, prompt, `input_artifacts` |
 | `span.call_tool(name, fn, **args)` / `span.tool_call(...)` | a tool call with arguments, result, latency and status |
+| `await span.allm(...)` / `await span.acall_tool(...)` | the same for async functions (the sync versions raise if given one) |
 | `span.send(to, content, kind, artifacts)` / `span.receive()` | messages through a per-agent mailbox |
 | `span.produce(name, content)` / `span.consume(artifact)` | artifacts and who used them |
 | `span.wait(reason, seconds)` / `span.waiting(reason)` | explicit waiting |
 | `span.note(text)` / `span.error(msg)` | annotations and errors |
 
-Return an `LLMResult(text, input_tokens, output_tokens, model)` from the function you pass to `span.llm` to record real usage; otherwise tokens are estimated from text length and flagged as estimated. Unknown models get a cost of `unknown`, never a silent `$0`.
+Return an `LLMResult(text, input_tokens, output_tokens, model)` from the function you pass to `span.llm` to record real usage; otherwise tokens are estimated from the prompt (`prompt=`, or the function's arguments) and the output, and flagged as estimated. A lone `prompt=` is passed to a function that takes an argument, so `span.llm(fn, prompt=p)` works. Models missing from the pricing table get a cost of `unknown`: they are left out of totals (marked `*`), never counted as `$0`. Only dated or provider-prefixed forms of a listed model id share its price.
 
-**Anthropic SDK**: `swarmeval.integrations.anthropic.instrument_client(client)` records every `messages.create` made inside an agent span with real usage; `anthropic_llm(client, model)` returns a prompt → `LLMResult` callable for `span.llm`.
+**Anthropic SDK**: `swarmeval.integrations.anthropic.instrument_client(client)` records every `messages.create` / `beta.messages.create` made inside an agent span with real usage (sync or async client); inside `span.llm` it fills in that call rather than recording it twice. `anthropic_llm(client, model)` returns a prompt → `LLMResult` callable for `span.llm` (async for an async client, for `span.allm`).
 
-`evaluate()` also accepts a bare `run(task, ctx)` function or a zero-argument factory. Use `clock_factory=SimClock` for simulated swarms that advance a virtual clock.
+`evaluate()` also accepts a `Swarm` class, a bare `run(task, ctx)` function (sync or `async`) or a zero-argument factory. Use `clock_factory=SimClock` for simulated swarms that advance a virtual clock. An `evaluator=` passed to `evaluate()` overrides the task and benchmark evaluators. `capture_text=False` keeps only short previews of prompts, outputs, tool arguments and artifacts in everything recorded and saved.
 
 ---
 
@@ -128,7 +130,7 @@ A `Task` has `task_id`, `input`, optional `expected`, `success_criteria`, `const
 ]}
 ```
 
-Built-in evaluators: `exact_match`, `contains_all` / `contains_any` (with `forbidden`), `regex`, `numeric`, `tool_use` (checks the trajectory), `constraints`, `composite`, or any callable `fn(task, output, trajectory)`. `Benchmark.load(path)` accepts JSON or JSONL; `Benchmark.validate()` checks ids and fields.
+Built-in evaluators: `exact_match`, `contains_all` / `contains_any` (with `forbidden`), `regex`, `numeric`, `tool_use` (checks the trajectory), `constraints`, `composite`, or any callable `fn(task, output, trajectory)`. `Benchmark.load(path)` accepts JSON or JSONL. `Benchmark.validate()` (run before any swarm run) checks ids and fields and builds every evaluator, so an unknown task field, an unknown evaluator type or key, a missing required key, or an evaluator with nothing to check (e.g. `contains_all` without keywords) fails up front. `Benchmark.save()` refuses evaluators that cannot be rebuilt from JSON (plain callables); register a spec type for them.
 
 ## What gets measured
 
@@ -142,16 +144,17 @@ Repeated trials use seeds derived from `(seed, task, trial)` so a run set is rep
 ## Outputs
 
 * `EvaluationResult.report()` – text report (above); `.summary()` / `.to_dict()` / `.save(path)` – JSON including the full run set.
-* `swarmeval.export.write_events_jsonl(trajectories, path)` – flat event stream for pandas / DuckDB.
-* `RunSet.save/load`, `Trajectory.save/load` – trajectories are the source of truth; `swarmeval report runs.json` recomputes everything from them.
+* `swarmeval.export.write_events_jsonl(trajectories, path)` / `write_events_parquet(...)` (needs `swarmeval[parquet]`) – flat event stream for pandas / DuckDB; `swarmeval export runs.json events.parquet` converts a saved run set.
+* `RunSet.save/load`, `Trajectory.save/load` – trajectories are the source of truth; `swarmeval report runs.json` recomputes everything from them, and `--pricing prices.json` (or `analyze_runs(runs, pricing=...)`) re-prices every call from its recorded model and tokens.
 * `render_trajectory(traj)` – the event-by-event text trace.
 
 ## CLI
 
 ```bash
 swarmeval demo [--trials N] [--out DIR] [--trace]
-swarmeval run    --swarm pkg.mod:factory --benchmark bench.json --trials 3 --out runs [--clock sim]
-swarmeval report runs/baseline.json [--trace N]
+swarmeval run    --swarm pkg.mod:factory --benchmark bench.json --trials 3 --out runs [--clock sim] [--pricing p.json] [--no-capture-text]
+swarmeval report runs/baseline.json [--trace N] [--pricing p.json]
+swarmeval export runs/baseline.json events.parquet [--format jsonl|parquet]
 ```
 
 ## Layout
@@ -164,12 +167,12 @@ swarmeval/
   evaluators.py    deterministic evaluators with JSON specs
   metrics/         performance, efficiency
   report/          text report and trajectory trace
-  export/          JSONL events
+  export/          JSONL and Parquet events
   integrations/    Anthropic SDK adapter
+  examples/        simulated research swarm + benchmark used by the demo and tests
   pricing.py       model pricing table
   stats.py         descriptive statistics
   cli.py
-examples/research_swarm.py   simulated swarm + benchmark used by the demo and tests
 tests/
 ```
 

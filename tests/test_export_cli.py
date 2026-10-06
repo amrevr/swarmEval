@@ -1,6 +1,6 @@
 import json
 
-from examples.research_swarm import build_benchmark, make_swarm
+from swarmeval.examples.research_swarm import build_benchmark, make_swarm
 from swarmeval import (Benchmark, EvaluationResult, FunctionSwarm, SimClock, Task, evaluate, read_events_jsonl,
                        render_trajectory, write_events_jsonl)
 from swarmeval.cli import main
@@ -89,7 +89,7 @@ def test_cli_demo_run_report(tmp_path, capsys):
     assert (out / "baseline.json").exists() and (out / "baseline.events.jsonl").exists()
     bench_path = tmp_path / "bench.json"
     build_benchmark(2).save(str(bench_path))
-    assert main(["run", "--swarm", "examples.research_swarm:make_swarm", "--benchmark", str(bench_path),
+    assert main(["run", "--swarm", "swarmeval.examples.research_swarm:make_swarm", "--benchmark", str(bench_path),
                  "--trials", "1", "--clock", "sim", "--label", "cli", "--out", str(tmp_path / "run")]) == 0
     assert main(["report", str(tmp_path / "run" / "cli.json"), "--trace", "0"]) == 0
     captured = capsys.readouterr()

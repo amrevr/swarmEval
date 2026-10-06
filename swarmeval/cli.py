@@ -2,23 +2,24 @@
 
     swarmeval demo [--trials N] [--out DIR]
     swarmeval run --swarm pkg.module:swarm --benchmark bench.json [--trials N] [--out DIR]
-    swarmeval report runs/baseline.json [--trace N]
+    swarmeval report runs/baseline.json [--trace N] [--pricing prices.json]
+    swarmeval export runs/baseline.json events.parquet [--format jsonl|parquet]
 """
 from __future__ import annotations
 
 import argparse
 import importlib
-import json
 import os
 import sys
 from typing import Any, Callable, List, Optional
 
 from . import __version__
-from .evaluate import EvaluationResult, analyze_runs, evaluate
+from .evaluate import EvaluationResult, analyze_runs, evaluate, load_runset
+from .export import export_events
 from .export.jsonl import write_events_jsonl
+from .pricing import PricingTable
 from .recorder import SimClock
 from .report.text import render_trajectory
-from .runner import RunSet
 from .schema import Benchmark
 
 
@@ -55,7 +56,7 @@ def _write_outputs(result: EvaluationResult, out: Optional[str]) -> None:
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
-    from examples.research_swarm import build_benchmark, make_swarm  # type: ignore
+    from .examples.research_swarm import build_benchmark, make_swarm
     result = evaluate(make_swarm, build_benchmark(), trials=args.trials, clock_factory=SimClock, progress=True)
     print(result.report())
     if args.trace:
@@ -68,22 +69,38 @@ def cmd_demo(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     swarm = _load_obj(args.swarm)
     bench = _load_benchmark(args.benchmark)
+    pricing = PricingTable.load(args.pricing) if args.pricing else None
     result = evaluate(swarm, bench, trials=args.trials, seed=args.seed, clock_factory=_clock_factory(args.clock),
-                      label=args.label, progress=True)
+                      label=args.label, progress=True, pricing=pricing, capture_text=not args.no_capture_text)
     print(result.report())
     _write_outputs(result, args.out)
     return 0
 
 
+def _load_runs_or_exit(path: str):
+    try:
+        return load_runset(path)
+    except ValueError as exc:
+        raise SystemExit(f"swarmeval: {exc}")
+
+
 def cmd_report(args: argparse.Namespace) -> int:
-    with open(args.path) as f:
-        d = json.load(f)
-    runs = RunSet.from_dict(d["runs"] if "runs" in d else d)
-    result = analyze_runs(runs)
+    runs = _load_runs_or_exit(args.path)
+    pricing = PricingTable.load(args.pricing) if args.pricing else None
+    result = analyze_runs(runs, pricing=pricing)
     print(result.report())
     if args.trace is not None:
+        if not 0 <= args.trace < len(runs):
+            raise SystemExit(f"swarmeval: --trace {args.trace} out of range (file has {len(runs)} runs)")
         print()
         print(render_trajectory(runs.trajectories[args.trace]))
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    runs = _load_runs_or_exit(args.path)
+    n = export_events(runs.trajectories, args.out, args.format or "")
+    print(f"wrote {n} events to {args.out}")
     return 0
 
 
@@ -106,12 +123,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     r.add_argument("--clock", default=None, help="'wall' (default), 'sim', or package.module:factory")
     r.add_argument("--label", default="baseline")
     r.add_argument("--out", default=None)
+    r.add_argument("--pricing", default=None, help='JSON {"model": [input, output], ...} in USD per 1M tokens')
+    r.add_argument("--no-capture-text", action="store_true",
+                   help="keep only short previews of prompts, outputs and artifacts")
     r.set_defaults(fn=cmd_run)
 
     rp = sub.add_parser("report", help="re-analyse a saved run set")
     rp.add_argument("path")
     rp.add_argument("--trace", type=int, default=None, metavar="N", help="also print trajectory N")
+    rp.add_argument("--pricing", default=None, help="re-price every LLM call with this JSON pricing table")
     rp.set_defaults(fn=cmd_report)
+
+    ex = sub.add_parser("export", help="convert a saved run set to an event stream (JSONL or Parquet)")
+    ex.add_argument("path", help="saved RunSet or EvaluationResult JSON")
+    ex.add_argument("out", help="output file (.jsonl or .parquet)")
+    ex.add_argument("--format", choices=["jsonl", "parquet"], default=None,
+                    help="default: inferred from the output extension")
+    ex.set_defaults(fn=cmd_export)
 
     args = p.parse_args(argv)
     return args.fn(args)

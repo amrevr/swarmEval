@@ -8,7 +8,7 @@ plug in your own judge in the meantime.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 from .schema import Evaluation, Task, Trajectory, to_text
 from .stats import mean
@@ -22,6 +22,10 @@ class Evaluator:
 
     def to_spec(self) -> Dict[str, Any]:
         return {"type": self.name}
+
+    def check(self, task: Task) -> None:
+        """Raise ``ValueError`` if this evaluator cannot judge ``task`` (e.g. it
+        has nothing to compare against).  Called by ``Benchmark.validate``."""
 
     def __call__(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
         return self.evaluate(task, output, trajectory)
@@ -46,6 +50,10 @@ class ExactMatch(Evaluator):
         ok = self._norm(output) == self._norm(expected)
         return Evaluation(ok, 1.0 if ok else 0.0, self.name, {"expected": expected})
 
+    def check(self, task: Task) -> None:
+        if self.expected is None and task.expected is None:
+            raise ValueError("exact_match needs 'expected' (in the spec or on the task)")
+
     def to_spec(self) -> Dict[str, Any]:
         return {"type": self.name, "expected": self.expected, "normalize": self.normalize}
 
@@ -61,10 +69,18 @@ class ContainsAll(Evaluator):
         self.forbidden = list(forbidden)
         self.case_insensitive = case_insensitive
 
-    def evaluate(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
+    def _keywords(self, task: Task) -> List[str]:
         keywords = self.keywords if self.keywords is not None else (
             task.expected if isinstance(task.expected, list) else [task.expected])
-        keywords = [str(k) for k in keywords if k is not None]
+        return [str(k) for k in keywords if k is not None]
+
+    def check(self, task: Task) -> None:
+        if not self._keywords(task):
+            raise ValueError(f"{self.name} has no keywords (set 'keywords' in the spec or a list "
+                             f"'expected' on the task); it would pass any output")
+
+    def evaluate(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
+        keywords = self._keywords(task)
         text = to_text(output)
         if self.case_insensitive:
             text_cmp = text.lower()
@@ -98,16 +114,22 @@ class ContainsAny(ContainsAll):
 class Regex(Evaluator):
     name = "regex"
 
-    def __init__(self, pattern: str, flags: int = re.IGNORECASE | re.DOTALL) -> None:
+    DEFAULT_FLAGS = int(re.IGNORECASE | re.DOTALL)
+
+    def __init__(self, pattern: str, flags: int = DEFAULT_FLAGS) -> None:
         self.pattern = pattern
-        self.flags = flags
+        self.flags = int(flags)
+        try:
+            re.compile(pattern, self.flags)
+        except re.error as exc:
+            raise ValueError(f"invalid regex {pattern!r}: {exc}") from None
 
     def evaluate(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
         ok = re.search(self.pattern, to_text(output), self.flags) is not None
         return Evaluation(ok, 1.0 if ok else 0.0, self.name, {"pattern": self.pattern})
 
     def to_spec(self) -> Dict[str, Any]:
-        return {"type": self.name, "pattern": self.pattern}
+        return {"type": self.name, "pattern": self.pattern, "flags": self.flags}
 
 
 class NumericTolerance(Evaluator):
@@ -118,16 +140,26 @@ class NumericTolerance(Evaluator):
         self.tolerance = tolerance
         self.relative = relative
 
+    # Thousands separators ("1,000", "12,000.5") are part of the number.
+    _NUMBER = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+    def check(self, task: Task) -> None:
+        expected = self.expected if self.expected is not None else task.expected
+        try:
+            float(expected)
+        except (TypeError, ValueError):
+            raise ValueError(f"numeric needs a numeric 'expected' (got {expected!r})") from None
+
     def evaluate(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
         expected = self.expected if self.expected is not None else task.expected
-        nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", to_text(output))
+        nums = self._NUMBER.findall(to_text(output))
         ok = False
         value: Optional[float] = None
         if nums and expected is not None:
             try:
                 exp = float(expected)
                 for n in reversed(nums):
-                    value = float(n)
+                    value = float(n.replace(",", ""))
                     tol = self.tolerance * abs(exp) if self.relative else self.tolerance
                     if abs(value - exp) <= tol:
                         ok = True
@@ -157,6 +189,11 @@ class CallableEvaluator(Evaluator):
         score = float(r)
         return Evaluation(score >= 0.5, score, self.name)
 
+    def to_spec(self) -> Dict[str, Any]:
+        # A Python callable cannot be rebuilt from JSON; the marker makes
+        # from_spec fail clearly instead of guessing.
+        return {"type": self.name, "unserializable": True}
+
 
 class ToolUseEvaluator(Evaluator):
     """Checks tool-use correctness from the trajectory: expected tools were
@@ -174,8 +211,9 @@ class ToolUseEvaluator(Evaluator):
             return Evaluation(False, 0.0, self.name, {"reason": "no trajectory"})
         calls = trajectory.tool_calls()
         used = {c.tool_name for c in calls if c.status == "success"}
+        attempted = {c.tool_name for c in calls}
         missing = [t for t in self.expected_tools if t not in used]
-        forbidden = [t for t in self.forbidden_tools if t in used]
+        forbidden = [t for t in self.forbidden_tools if t in attempted]  # a failed call is still a violation
         errors = [c for c in calls if c.status == "error"]
         checks = [not missing, not forbidden, self.allow_errors or not errors]
         score = sum(checks) / len(checks)
@@ -199,6 +237,10 @@ class Constraints(Evaluator):
         passed = all(r.success for _, r in results)
         score = mean([r.score for _, r in results]) if results else 1.0
         return Evaluation(passed, score, self.name, {n: r.to_dict() for n, r in results}, constraints_passed=passed)
+
+    def check(self, task: Task) -> None:
+        for c in self.checks:
+            c.check(task)
 
     def to_spec(self) -> Dict[str, Any]:
         return {"type": self.name, "checks": [c.to_spec() for c in self.checks]}
@@ -224,6 +266,10 @@ class Composite(Evaluator):
         ok = score >= self.threshold and req_ok
         return Evaluation(ok, score, self.name, {n: r.to_dict() for n, r in results})
 
+    def check(self, task: Task) -> None:
+        for e in self.evaluators:
+            e.check(task)
+
     def to_spec(self) -> Dict[str, Any]:
         return {"type": self.name, "evaluators": [e.to_spec() for e in self.evaluators],
                 "weights": self.weights, "threshold": self.threshold, "required": self.required}
@@ -233,21 +279,32 @@ class Composite(Evaluator):
 # Registry
 # --------------------------------------------------------------------------- #
 _REGISTRY: Dict[str, Callable[[Dict[str, Any]], Evaluator]] = {}
+_KEYS: Dict[str, Optional[Set[str]]] = {}
 
 
-def register(name: str, factory: Callable[[Dict[str, Any]], Evaluator]) -> None:
+def register(name: str, factory: Callable[[Dict[str, Any]], Evaluator],
+             keys: Optional[Iterable[str]] = None) -> None:
+    """Register a spec ``type``.  ``keys`` lists the spec keys the factory
+    reads; other keys are rejected so typos fail loudly.  ``None`` accepts any."""
     _REGISTRY[name] = factory
+    _KEYS[name] = set(keys) if keys is not None else None
 
 
-register("exact_match", lambda s: ExactMatch(s.get("expected"), s.get("normalize", True)))
-register("contains_all", lambda s: ContainsAll(s.get("keywords"), s.get("forbidden", ()), s.get("case_insensitive", True)))
-register("contains_any", lambda s: ContainsAny(s.get("keywords"), s.get("forbidden", ()), s.get("case_insensitive", True)))
-register("regex", lambda s: Regex(s["pattern"]))
-register("numeric", lambda s: NumericTolerance(s.get("expected"), s.get("tolerance", 1e-6), s.get("relative", False)))
-register("tool_use", lambda s: ToolUseEvaluator(s.get("expected_tools", ()), s.get("forbidden_tools", ()), s.get("allow_errors", False)))
-register("constraints", lambda s: Constraints([from_spec(c) for c in s.get("checks", [])]))
+register("exact_match", lambda s: ExactMatch(s.get("expected"), s.get("normalize", True)),
+         ["expected", "normalize"])
+register("contains_all", lambda s: ContainsAll(s.get("keywords"), s.get("forbidden", ()), s.get("case_insensitive", True)),
+         ["keywords", "forbidden", "case_insensitive"])
+register("contains_any", lambda s: ContainsAny(s.get("keywords"), s.get("forbidden", ()), s.get("case_insensitive", True)),
+         ["keywords", "forbidden", "case_insensitive"])
+register("regex", lambda s: Regex(s["pattern"], s.get("flags", Regex.DEFAULT_FLAGS)), ["pattern", "flags"])
+register("numeric", lambda s: NumericTolerance(s.get("expected"), s.get("tolerance", 1e-6), s.get("relative", False)),
+         ["expected", "tolerance", "relative"])
+register("tool_use", lambda s: ToolUseEvaluator(s.get("expected_tools", ()), s.get("forbidden_tools", ()), s.get("allow_errors", False)),
+         ["expected_tools", "forbidden_tools", "allow_errors"])
+register("constraints", lambda s: Constraints([from_spec(c) for c in s.get("checks", [])]), ["checks"])
 register("composite", lambda s: Composite([from_spec(e) for e in s.get("evaluators", [])], s.get("weights"),
-                                          s.get("threshold", 0.5), s.get("required", ())))
+                                          s.get("threshold", 0.5), s.get("required", ())),
+         ["evaluators", "weights", "threshold", "required"])
 
 
 def from_spec(spec: Any) -> Evaluator:
@@ -261,13 +318,26 @@ def from_spec(spec: Any) -> Evaluator:
     if not isinstance(spec, dict) or "type" not in spec:
         raise ValueError(f"cannot build evaluator from {spec!r}")
     t = spec["type"]
+    if spec.get("unserializable"):
+        raise ValueError(f"evaluator {t!r} was a Python object that cannot be rebuilt from JSON; "
+                         f"pass it again in code or register() a spec type for it")
     if t not in _REGISTRY:
         raise ValueError(f"unknown evaluator type {t!r}; known: {sorted(_REGISTRY)}")
-    return _REGISTRY[t](spec)
+    allowed = _KEYS.get(t)
+    if allowed is not None:
+        unknown = sorted(k for k in spec if k != "type" and k not in allowed)
+        if unknown:
+            raise ValueError(f"evaluator {t!r}: unknown key(s) {unknown}; known: {sorted(allowed)}")
+    try:
+        return _REGISTRY[t](spec)
+    except KeyError as exc:
+        raise ValueError(f"evaluator {t!r}: missing required key {exc}") from None
 
 
-def resolve(task: Task, *fallbacks: Any) -> Optional[Evaluator]:
-    for candidate in (task.evaluator, *fallbacks):
+def resolve(task: Task, *fallbacks: Any, override: Any = None) -> Optional[Evaluator]:
+    """Pick the evaluator for ``task``: an explicit ``override`` (e.g. passed to
+    ``evaluate()``) wins, then the task's own, then each fallback in order."""
+    for candidate in (override, task.evaluator, *fallbacks):
         if candidate is not None:
             return from_spec(candidate)
     return None

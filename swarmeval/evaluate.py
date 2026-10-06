@@ -24,9 +24,9 @@ class EfficiencySummary:
     llm_calls: Summary
     tool_calls: Summary
     messages: Summary
-    cost_usd: Summary
+    cost_usd: Summary                 # over runs whose cost is known (n says how many)
     cost_complete: bool
-    cost_total: float
+    cost_total: Optional[float]       # None when no run could be priced
     cost_per_success: Optional[float]
     wall_clock_s: Summary
     agent_time_s: Summary
@@ -40,22 +40,29 @@ class EfficiencySummary:
 
 def summarize_efficiency(trajectories: Sequence[Trajectory], effs: Sequence[EfficiencyMetrics]) -> EfficiencySummary:
     S = summarize
+    # Unknown costs stay unknown: they are left out of sums and flagged via
+    # cost_complete, never counted as $0.
     cost_complete = all(e.cost_complete for e in effs)
-    costs = [e.cost_usd or 0.0 for e in effs]
-    total_cost = sum(costs)
+    costs = [e.cost_usd for e in effs if e.cost_usd is not None]
+    total_cost: Optional[float] = sum(costs) if costs else None
     successes = sum(1 for t in trajectories if t.succeeded)
     per_agent: Dict[str, Dict[str, Any]] = {}
     agent_runs: Dict[str, int] = Counter()
     roles: Dict[str, Optional[str]] = {}
+    agent_cost_complete: Dict[str, bool] = {}
     acc: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
     for e in effs:
         for aid, ae in e.per_agent.items():
             agent_runs[aid] += 1
             roles[aid] = roles.get(aid) or ae.role
+            agent_cost_complete[aid] = agent_cost_complete.get(aid, True) and ae.cost_complete
             acc[aid]["tokens"].append(ae.total_tokens)
             acc[aid]["input_tokens"].append(ae.input_tokens)
             acc[aid]["output_tokens"].append(ae.output_tokens)
-            acc[aid]["cost_usd"].append(ae.cost_usd or 0.0)
+            if ae.cost_usd is not None:
+                acc[aid]["cost_usd"].append(ae.cost_usd)
+            elif ae.llm_calls == 0:
+                acc[aid]["cost_usd"].append(0.0)
             acc[aid]["llm_calls"].append(ae.llm_calls)
             acc[aid]["tool_calls"].append(ae.tool_calls)
             acc[aid]["messages_sent"].append(ae.messages_sent)
@@ -66,17 +73,20 @@ def summarize_efficiency(trajectories: Sequence[Trajectory], effs: Sequence[Effi
     n = max(1, len(effs))
     total_tokens = sum(e.total_tokens for e in effs) or 1
     for aid, d in acc.items():
-        per_agent[aid] = {k: mean(v) for k, v in d.items()}
+        per_agent[aid] = {k: mean(v) for k, v in d.items() if k != "cost_usd"}
+        agent_costs = d.get("cost_usd", [])
+        per_agent[aid]["cost_usd"] = mean(agent_costs) if agent_costs else None
+        per_agent[aid]["total_cost_usd"] = sum(agent_costs) if agent_costs else None
+        per_agent[aid]["cost_complete"] = agent_cost_complete.get(aid, True)
         per_agent[aid]["role"] = roles.get(aid)
         per_agent[aid]["invocation_rate"] = agent_runs[aid] / n
-        per_agent[aid]["total_cost_usd"] = sum(d["cost_usd"])
         per_agent[aid]["token_share"] = sum(d["tokens"]) / total_tokens
     return EfficiencySummary(
         tokens=S(e.total_tokens for e in effs), input_tokens=S(e.input_tokens for e in effs),
         output_tokens=S(e.output_tokens for e in effs), llm_calls=S(e.llm_calls for e in effs),
         tool_calls=S(e.tool_calls for e in effs), messages=S(e.messages for e in effs),
         cost_usd=S(costs), cost_complete=cost_complete, cost_total=total_cost,
-        cost_per_success=(total_cost / successes) if successes else None,
+        cost_per_success=(total_cost / successes) if successes and total_cost is not None else None,
         wall_clock_s=S(e.wall_clock_s for e in effs), agent_time_s=S(e.agent_time_s for e in effs),
         waiting_time_s=S(e.waiting_time_s for e in effs), errors=S(e.errors for e in effs), per_agent=per_agent)
 
@@ -105,7 +115,10 @@ class EvaluationResult:
 
     @property
     def cost(self) -> Dict[str, Any]:
-        return {"total": self.efficiency.cost_total, "per_run": self.efficiency.cost_usd.mean,
+        """Known cost; values are ``None`` when nothing could be priced and
+        ``complete`` is False when some calls were unpriced."""
+        per_run = self.efficiency.cost_usd.mean if self.efficiency.cost_usd.n else None
+        return {"total": self.efficiency.cost_total, "per_run": per_run,
                 "per_success": self.efficiency.cost_per_success, "complete": self.efficiency.cost_complete}
 
     @property
@@ -124,7 +137,7 @@ class EvaluationResult:
             "success_rate": round(self.success_rate, 4),
             "mean_score": round(self.performance.mean_score, 4),
             "run_errors": self.performance.run_errors,
-            "cost": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in self.cost.items()},
+            "cost": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in self.cost.items()},  # None = unknown
             "latency": {k: round(v, 3) for k, v in self.latency.items()},
             "tokens_per_run": round(self.efficiency.tokens.mean, 1),
             "agents": self.agents,
@@ -150,26 +163,39 @@ class EvaluationResult:
             json.dump(self.to_dict(include_runs=include_runs), f, indent=1, default=str)
 
     @classmethod
-    def load(cls, path: str) -> "EvaluationResult":
-        with open(path) as f:
-            d = json.load(f)
-        if "runs" not in d:
-            raise ValueError("file has no trajectories; save with include_runs=True to reload")
-        return analyze_runs(RunSet.from_dict(d["runs"]))
+    def load(cls, path: str, pricing: Optional[PricingTable] = None) -> "EvaluationResult":
+        """Reload a saved result (re-priced with ``pricing`` if given)."""
+        return analyze_runs(load_runset(path), pricing=pricing)
 
     def report(self, **kwargs: Any) -> str:
         from .report.text import render_text
         return render_text(self, **kwargs)
 
     def __repr__(self) -> str:
+        total = self.efficiency.cost_total
+        cost = "unknown" if total is None else f"${total:.2f}" + ("" if self.efficiency.cost_complete else "*")
         return (f"EvaluationResult(label={self.label!r}, runs={len(self.runs)}, success={self.success_rate:.3f}, "
-                f"cost=${self.efficiency.cost_total:.2f})")
+                f"cost={cost})")
 
 
-def analyze_runs(runs: RunSet) -> EvaluationResult:
-    """Recompute the evaluation from trajectories (e.g. a saved RunSet)."""
-    per_run = [compute_efficiency(t) for t in runs.trajectories]
-    performance = compute_performance(runs.trajectories)
+def load_runset(path: str) -> RunSet:
+    """Load trajectories from a saved RunSet or a saved EvaluationResult.
+    Raises ``ValueError`` for a result saved without its trajectories."""
+    with open(path) as f:
+        d = json.load(f)
+    if "runs" in d:
+        return RunSet.from_dict(d["runs"])
+    if "trajectories" in d:
+        return RunSet.from_dict(d)
+    raise ValueError(f"{path} has no trajectories; save with include_runs=True to reload")
+
+
+def analyze_runs(runs: RunSet, pricing: Optional[PricingTable] = None) -> EvaluationResult:
+    """Recompute the evaluation from trajectories (e.g. a saved RunSet).
+    With ``pricing``, every LLM call is re-priced from its recorded model and
+    token counts instead of using the cost stored at run time."""
+    per_run = [compute_efficiency(t, pricing) for t in runs.trajectories]
+    performance = compute_performance(runs.trajectories, per_run)
     efficiency = summarize_efficiency(runs.trajectories, per_run)
     return EvaluationResult(runs, per_run, performance, efficiency)
 
@@ -177,13 +203,17 @@ def analyze_runs(runs: RunSet) -> EvaluationResult:
 def evaluate(swarm: Any, benchmark: Benchmark, trials: int = 1, seed: int = 0, evaluator: Any = None,
              clock_factory: Optional[Callable[[], Clock]] = None, pricing: Optional[PricingTable] = None,
              label: str = "baseline", progress: bool = False, raise_errors: bool = False,
-             on_run: Optional[Callable[[Trajectory], None]] = None) -> EvaluationResult:
+             on_run: Optional[Callable[[Trajectory], None]] = None, capture_text: bool = True,
+             max_text_chars: int = 20000) -> EvaluationResult:
     """Run ``swarm`` on ``benchmark`` ``trials`` times and return an EvaluationResult.
 
-    ``swarm`` may be a Swarm instance, a ``factory() -> Swarm`` or a bare
-    ``run(task, ctx)`` function.
+    ``swarm`` may be a Swarm instance or class, a ``factory() -> Swarm`` or a
+    bare ``run(task, ctx)`` function (sync or async).  ``evaluator``, when
+    given, overrides the task and benchmark evaluators.  ``capture_text=False``
+    keeps only short previews of prompts, outputs and artifacts.
     """
     opts = RunOptions(trials=trials, seed=seed, clock_factory=clock_factory, pricing=pricing, evaluator=evaluator,
-                      progress=progress, raise_errors=raise_errors, on_run=on_run)
+                      progress=progress, raise_errors=raise_errors, on_run=on_run, capture_text=capture_text,
+                      max_text_chars=max_text_chars)
     runs = SwarmRunner(swarm, benchmark, label=label, options=opts).run()
     return analyze_runs(runs)

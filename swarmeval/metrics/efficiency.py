@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from ..pricing import PricingTable
 from ..schema import EventType, Trajectory
 
 
@@ -43,6 +44,7 @@ class AgentEfficiency:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: Optional[float] = None
+    cost_complete: bool = True
     self_time_s: float = 0.0     # span time excluding nested child agents
     busy_time_s: float = 0.0     # time inside own llm/tool calls
     idle_time_s: float = 0.0     # self time not spent in calls (waiting)
@@ -83,7 +85,18 @@ class EfficiencyMetrics:
         return d
 
 
-def compute_efficiency(traj: Trajectory) -> EfficiencyMetrics:
+def event_cost(ev, pricing: Optional[PricingTable]) -> Optional[float]:
+    """Cost of an LLM_CALL event: re-priced from its model and tokens when a
+    pricing table is given, else the cost recorded at run time."""
+    if pricing is None:
+        return ev.cost_usd
+    return pricing.cost(ev.model, ev.input_tokens, ev.output_tokens, ev.cache_read_tokens, ev.cache_write_tokens)
+
+
+def compute_efficiency(traj: Trajectory, pricing: Optional[PricingTable] = None) -> EfficiencyMetrics:
+    """Efficiency of one run.  ``cost_usd`` is ``None`` when no LLM call could
+    be priced (never a silent zero); ``cost_complete`` is False when any call
+    is unpriced."""
     m = EfficiencyMetrics()
     per: Dict[str, AgentEfficiency] = {}
 
@@ -95,23 +108,26 @@ def compute_efficiency(traj: Trajectory) -> EfficiencyMetrics:
     busy: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
     for ev in traj.events:
         if ev.event_type == EventType.LLM_CALL.value:
+            cost = event_cost(ev, pricing)
             m.llm_calls += 1
-            m.input_tokens += ev.input_tokens
+            m.input_tokens += ev.prompt_tokens
             m.output_tokens += ev.output_tokens
             m.llm_latency_s += ev.duration_s
-            if ev.cost_usd is None:
+            if cost is None:
                 m.cost_complete = False
             else:
-                m.cost_usd = (m.cost_usd or 0.0) + ev.cost_usd
+                m.cost_usd = (m.cost_usd or 0.0) + cost
             if ev.span_id:
                 busy[ev.span_id].append((ev.timestamp, ev.end_timestamp))
             if ev.agent_id:
                 a = agent(ev.agent_id)
                 a.llm_calls += 1
-                a.input_tokens += ev.input_tokens
+                a.input_tokens += ev.prompt_tokens
                 a.output_tokens += ev.output_tokens
-                if ev.cost_usd is not None:
-                    a.cost_usd = (a.cost_usd or 0.0) + ev.cost_usd
+                if cost is None:
+                    a.cost_complete = False
+                else:
+                    a.cost_usd = (a.cost_usd or 0.0) + cost
             if ev.status == "error":
                 m.errors += 1
                 if ev.agent_id:
@@ -134,11 +150,14 @@ def compute_efficiency(traj: Trajectory) -> EfficiencyMetrics:
                 agent(ev.sender).messages_sent += 1
         elif ev.event_type == EventType.ARTIFACT.value and ev.agent_id:
             agent(ev.agent_id).artifacts_produced += 1
-        elif ev.event_type == EventType.ERROR.value:
+        elif ev.event_type == EventType.ERROR.value and not ev.metadata.get("propagated"):
+            # an exception leaving enclosing spans / the run is the same failure
             m.errors += 1
+            if ev.agent_id and ev.span_id:
+                agent(ev.agent_id).errors += 1
     m.total_tokens = m.input_tokens + m.output_tokens
     if m.llm_calls == 0:
-        m.cost_usd = 0.0
+        m.cost_usd = 0.0  # nothing to pay for (matches Trajectory.cost_usd)
 
     # span-based timing
     children: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
@@ -157,7 +176,11 @@ def compute_efficiency(traj: Trajectory) -> EfficiencyMetrics:
         a.self_time_s += self_time
         a.busy_time_s += busy_time
         a.idle_time_s += max(0.0, self_time - busy_time)
-    m.per_agent = per
+    # Stable agent order (first start, then id): event order varies between
+    # runs when agents work concurrently.
+    first = {aid: min((s.start for s in traj.spans.values() if s.agent_id == aid), default=float("inf"))
+             for aid in per}
+    m.per_agent = {aid: per[aid] for aid in sorted(per, key=lambda a: (first[a], a))}
     m.agent_time_s = sum(a.self_time_s for a in per.values())
     m.waiting_time_s = sum(a.idle_time_s for a in per.values())
     m.wall_clock_s = traj.duration

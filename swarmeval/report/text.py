@@ -62,7 +62,7 @@ def render_text(result: Any, show_agents: bool = True, show_tasks: bool = True) 
         rows.append(("Runs Crashed", f"{perf.run_errors}/{n_runs}", "⚠"))
     rows += [
         None,
-        ("Cost / Run", _money(eff.cost_usd.mean, eff.cost_complete)),
+        ("Cost / Run", _money(result.cost["per_run"], eff.cost_complete)),
         ("Cost / Successful Task", _money(eff.cost_per_success, eff.cost_complete)),
         ("Total Cost", _money(eff.cost_total, eff.cost_complete)),
         ("Tokens / Run", f"{eff.tokens.mean:,.0f}  (in {eff.input_tokens.mean:,.0f} / out {eff.output_tokens.mean:,.0f})"),
@@ -78,7 +78,8 @@ def render_text(result: Any, show_agents: bool = True, show_tasks: bool = True) 
         rows.append(("Errors (all runs)", f"{eff.errors.total:.0f}", "⚠"))
     parts = [box("SWARM EVALUATION", rows)]
     if not eff.cost_complete:
-        parts.append("  * cost incomplete: some models have no pricing entry")
+        parts.append("  * cost incomplete: some models have no pricing entry (unpriced calls are excluded, "
+                     "not counted as $0; re-price with `swarmeval report --pricing`)")
     if perf.trials > 1:
         parts.append("  per-trial success: " + ", ".join(_pct(x) for x in perf.per_trial))
 
@@ -89,14 +90,15 @@ def render_text(result: Any, show_agents: bool = True, show_tasks: bool = True) 
         for aid, u in sorted(eff.per_agent.items(), key=lambda kv: -kv[1]["token_share"]):
             parts.append(f"  {aid:<16}{(u.get('role') or '-')[:11]:<12}{bar(u['token_share'])} {u['token_share']*100:>4.0f}%"
                          f"{u['llm_calls']:>5.1f}{u['tool_calls']:>6.1f}{u['messages_sent']:>6.1f}"
-                         f"{u['self_time_s']:>7.1f}s{_money(u['cost_usd']):>10}")
+                         f"{u['self_time_s']:>7.1f}s{_money(u['cost_usd'], u.get('cost_complete', True)):>10}")
 
     if show_tasks and perf.per_task:
         parts.append("")
         parts.append("TASKS")
         parts.append(f"  {'task':<16}{'success':>9}{'score':>8}{'cost':>10}{'latency':>9}")
         for tid, t in perf.per_task.items():
-            parts.append(f"  {tid:<16}{_pct(t['success_rate']):>9}{t['score']:>8.2f}{_money(t['cost_usd']):>10}"
+            parts.append(f"  {tid:<16}{_pct(t['success_rate']):>9}{t['score']:>8.2f}"
+                         f"{_money(t['cost_usd'], t.get('cost_complete', True)):>10}"
                          f"{t['latency_s']:>8.1f}s")
     parts.append("")
     parts.append(f"Evaluators: {', '.join(perf.evaluators) or 'none'}")
@@ -119,7 +121,9 @@ def render_trajectory(traj: Trajectory, max_events: int = 200) -> str:
         indent = "  " * max(0, depth.get(ev.span_id, 0) - (1 if boundary else 0))
         et = ev.event_type
         if et == EventType.LLM_CALL.value:
-            detail = f"{ev.model or '?'}  {ev.input_tokens}→{ev.output_tokens} tok  {ev.duration_s:.2f}s  {_money(ev.cost_usd)}"
+            cached = f" ({ev.cache_read_tokens} cached)" if ev.cache_read_tokens else ""
+            detail = (f"{ev.model or '?'}  {ev.prompt_tokens}{cached}→{ev.output_tokens} tok  "
+                      f"{ev.duration_s:.2f}s  {_money(ev.cost_usd)}")
         elif et == EventType.TOOL_CALL.value:
             detail = f"{ev.tool_name}({preview(ev.tool_args, 60)})  {ev.duration_s:.2f}s"
         elif et == EventType.MESSAGE.value:

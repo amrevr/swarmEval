@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -90,6 +90,34 @@ def preview(obj: Any, limit: int = 240) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+@dataclass
+class TextPolicy:
+    """What text is kept in recorded and saved data.  With ``capture`` off
+    only a short preview is kept; otherwise anything longer than ``max_chars``
+    (measured on its text form) is truncated."""
+    capture: bool = True
+    max_chars: int = 20000
+
+    def apply(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if not self.capture:
+            return preview(obj, 120)
+        if isinstance(obj, (bool, int, float)):
+            return obj
+        text = to_text(obj)
+        if len(text) > self.max_chars:
+            return text[: self.max_chars] + "…[truncated]"
+        return obj
+
+    def to_metadata(self) -> Dict[str, Any]:
+        return {"capture_text": self.capture, "max_text_chars": self.max_chars}
+
+    @classmethod
+    def from_metadata(cls, md: Dict[str, Any]) -> "TextPolicy":
+        return cls(bool(md.get("capture_text", True)), int(md.get("max_text_chars", 20000)))
+
+
 # --------------------------------------------------------------------------- #
 # Events
 # --------------------------------------------------------------------------- #
@@ -114,6 +142,8 @@ class Event:
     model: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0             # prompt-cache reads (billed below the input rate)
+    cache_write_tokens: int = 0            # prompt-cache writes (billed above the input rate)
     cost_usd: Optional[float] = None
     tool_name: Optional[str] = None
     tool_args: Any = None
@@ -137,8 +167,13 @@ class Event:
         return (self.latency_ms or 0.0) / 1000.0
 
     @property
+    def prompt_tokens(self) -> int:
+        """All input processed by the model, cached or not."""
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
+    @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return self.prompt_tokens + self.output_tokens
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -233,17 +268,31 @@ class Task:
             raise ValueError(f"task {self.task_id!r}: difficulty must be simple|moderate|hard")
 
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        ev = self.evaluator
-        if ev is not None and not isinstance(ev, dict):
-            spec = getattr(ev, "to_spec", None)
-            d["evaluator"] = spec() if callable(spec) else {"type": type(ev).__name__}
+        # The evaluator may hold locks or clients that cannot be deep-copied,
+        # so it is left out of asdict() and replaced by its spec.
+        d = asdict(replace(self, evaluator=None))
+        d["evaluator"] = evaluator_spec(self.evaluator)
         return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Task":
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        unknown = sorted(k for k in d if k not in known)
+        if unknown:
+            raise ValueError(f"task {d.get('task_id')!r}: unknown field(s) {unknown}; known: {sorted(known)}")
+        return cls(**d)
+
+
+def evaluator_spec(ev: Any) -> Any:
+    """JSON spec for an evaluator.  Evaluators that cannot be rebuilt from JSON
+    (plain callables, unregistered classes) get an ``unserializable`` marker so
+    that reloading them fails with a clear message instead of a wrong judgment."""
+    if ev is None or isinstance(ev, dict):
+        return ev
+    spec = getattr(ev, "to_spec", None)
+    if callable(spec):
+        return spec()
+    return {"type": getattr(ev, "__name__", type(ev).__name__), "unserializable": True}
 
 
 @dataclass
@@ -266,22 +315,27 @@ class Benchmark:
         raise KeyError(task_id)
 
     def validate(self) -> None:
+        """Check ids and fields, and build every task's evaluator so a bad
+        spec fails here rather than after the swarm has already run."""
+        from .evaluators import resolve  # local import: evaluators imports schema
         seen = set()
         for t in self.tasks:
             t.validate()
             if t.task_id in seen:
                 raise ValueError(f"duplicate task_id {t.task_id!r} in benchmark {self.name!r}")
             seen.add(t.task_id)
+            try:
+                ev = resolve(t, self.default_evaluator)
+                if ev is not None:
+                    ev.check(t)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ValueError(f"task {t.task_id!r}: invalid evaluator: {exc}") from None
 
     def to_dict(self) -> Dict[str, Any]:
-        ev = self.default_evaluator
-        if ev is not None and not isinstance(ev, dict):
-            spec = getattr(ev, "to_spec", None)
-            ev = spec() if callable(spec) else None
         return {
             "name": self.name,
             "tasks": [t.to_dict() for t in self.tasks],
-            "default_evaluator": ev,
+            "default_evaluator": evaluator_spec(self.default_evaluator),
             "metadata": self.metadata,
         }
 
@@ -295,8 +349,16 @@ class Benchmark:
         )
 
     def save(self, path: str) -> None:
+        """Write the benchmark as JSON.  Raises if an evaluator could not be
+        rebuilt from the file (e.g. a lambda) instead of writing a benchmark
+        that only fails on reload."""
+        from .evaluators import from_spec  # local import: evaluators imports schema
+        d = self.to_dict()
+        for spec in [d["default_evaluator"]] + [t["evaluator"] for t in d["tasks"]]:
+            if spec is not None:
+                from_spec(spec)
         with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2, default=str)
+            json.dump(d, f, indent=2, default=str)
 
     @classmethod
     def load(cls, path: str) -> "Benchmark":
@@ -382,7 +444,8 @@ class Trajectory:
 
     def agent_ids(self) -> List[str]:
         seen: List[str] = []
-        for s in sorted(self.spans.values(), key=lambda s: s.start):
+        # agent id breaks ties so concurrent agents starting together keep a stable order
+        for s in sorted(self.spans.values(), key=lambda s: (s.start, s.agent_id)):
             if s.agent_id not in seen:
                 seen.append(s.agent_id)
         return seen
@@ -393,7 +456,7 @@ class Trajectory:
 
     @property
     def input_tokens(self) -> int:
-        return sum(e.input_tokens for e in self.llm_calls())
+        return sum(e.prompt_tokens for e in self.llm_calls())
 
     @property
     def output_tokens(self) -> int:
@@ -405,8 +468,12 @@ class Trajectory:
 
     @property
     def cost_usd(self) -> Optional[float]:
-        costs = [e.cost_usd for e in self.llm_calls()]
-        known = [c for c in costs if c is not None]
+        """Sum of known LLM costs: ``0.0`` with no LLM calls, ``None`` when no
+        call could be priced.  Check ``cost_is_complete`` for partial sums."""
+        calls = self.llm_calls()
+        if not calls:
+            return 0.0
+        known = [e.cost_usd for e in calls if e.cost_usd is not None]
         if not known:
             return None
         return float(sum(known))
@@ -425,6 +492,14 @@ class Trajectory:
 
     # -- serialisation --------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
+        # Artifacts and the final output stay complete in memory (swarms read
+        # them back), so the text policy is applied here, on the way out.
+        policy = TextPolicy.from_metadata(self.metadata)
+        artifacts = {}
+        for k, a in self.artifacts.items():
+            ad = asdict(replace(a, content=None))
+            ad["content"] = policy.apply(a.content)
+            artifacts[k] = ad
         return {
             "run_id": self.run_id,
             "task_id": self.task_id,
@@ -432,11 +507,11 @@ class Trajectory:
             "seed": self.seed,
             "trial": self.trial,
             "events": [e.to_dict() for e in self.events],
-            "artifacts": {k: a.to_dict() for k, a in self.artifacts.items()},
+            "artifacts": artifacts,
             "spans": {k: s.to_dict() for k, s in self.spans.items()},
             "started_at": self.started_at,
             "ended_at": self.ended_at,
-            "final_output": self.final_output,
+            "final_output": policy.apply(self.final_output),
             "output_artifacts": self.output_artifacts,
             "status": self.status,
             "error": self.error,

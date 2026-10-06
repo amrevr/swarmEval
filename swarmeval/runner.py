@@ -6,7 +6,6 @@ import hashlib
 import inspect
 import json
 import sys
-import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -36,8 +35,13 @@ SwarmFactory = Callable[[], Swarm]
 
 
 def as_factory(swarm: Any) -> SwarmFactory:
-    """Accept a Swarm instance, a zero-argument ``factory() -> Swarm`` or a
-    bare ``run(task, ctx)`` function and normalise to a factory."""
+    """Accept a Swarm instance, a Swarm class, a zero-argument
+    ``factory() -> Swarm`` or a bare ``run(task, ctx)`` function and
+    normalise to a factory."""
+    if isinstance(swarm, type):
+        if not callable(getattr(swarm, "run", None)):
+            raise TypeError(f"{swarm.__name__} has no run(task, ctx) method")
+        return swarm  # the class itself is the factory: a fresh instance per run
     if hasattr(swarm, "run") and callable(getattr(swarm, "run")):
         return lambda: swarm
     if callable(swarm):
@@ -52,6 +56,23 @@ def as_factory(swarm: Any) -> SwarmFactory:
             return lambda: FunctionSwarm(fn)
         return swarm  # assume factory()
     raise TypeError("swarm must be a Swarm, a factory() -> Swarm, or a run(task, ctx) function")
+
+
+def _await(aw: Any) -> Any:
+    """Run an async swarm's ``run`` coroutine to completion."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_as_coro(aw))
+    if inspect.iscoroutine(aw):
+        aw.close()
+    raise RuntimeError("an async swarm cannot be evaluated from inside a running event loop; "
+                       "call evaluate() from synchronous code (e.g. in a worker thread)")
+
+
+async def _as_coro(aw: Any) -> Any:
+    return await aw
 
 
 def derive_seed(base: int, task_id: str, trial: int) -> int:
@@ -69,6 +90,7 @@ class RunOptions:
     evaluator: Any = None
     raise_errors: bool = False
     capture_text: bool = True
+    max_text_chars: int = 20000
     on_run: Optional[Callable[[Trajectory], None]] = None
     progress: bool = False
 
@@ -135,6 +157,14 @@ class SwarmRunner:
         self.label = label
         self.options = options or RunOptions(**kwargs)
         self.benchmark.validate()
+        # Build every evaluator up front so a bad spec fails before any
+        # (possibly paid) run, and each run reuses the same instance.
+        self._evaluators: Dict[str, Optional[_evaluators.Evaluator]] = {}
+        for task in self.benchmark.tasks:
+            ev = _evaluators.resolve(task, self.benchmark.default_evaluator, override=self.options.evaluator)
+            if ev is not None:
+                ev.check(task)
+            self._evaluators[task.task_id] = ev
 
     def _clock(self) -> Clock:
         return self.options.clock_factory() if self.options.clock_factory else WallClock()
@@ -142,8 +172,8 @@ class SwarmRunner:
     def run_task(self, task: Task, trial: int = 0) -> Trajectory:
         opts = self.options
         seed = derive_seed(opts.seed, task.task_id, trial)
-        ctx = RunContext(task, clock=self._clock(), seed=seed, trial=trial,
-                         pricing=opts.pricing, capture_text=opts.capture_text)
+        ctx = RunContext(task, clock=self._clock(), seed=seed, trial=trial, pricing=opts.pricing,
+                         capture_text=opts.capture_text, max_text_chars=opts.max_text_chars)
         swarm = self.factory()
         ctx.start()
         output: Any = None
@@ -151,6 +181,8 @@ class SwarmRunner:
         error: Optional[str] = None
         try:
             output = swarm.run(task, ctx)
+            if inspect.isawaitable(output):
+                output = _await(output)
             if ctx.trajectory.final_output is None:
                 ctx.set_output(output)
             else:
@@ -158,7 +190,7 @@ class SwarmRunner:
         except Exception as exc:  # the swarm crashed -- that is a result, not a bug in SwarmEval
             status = Status.ERROR.value
             error = f"{type(exc).__name__}: {exc}"
-            ctx.record(EventType.ERROR, error=error, content=traceback.format_exc()[-2000:])
+            ctx.record_exception(exc)
             if opts.raise_errors:
                 raise
         traj = ctx.finish(status, error)
@@ -172,7 +204,10 @@ class SwarmRunner:
         return traj
 
     def _evaluate(self, task: Task, output: Any, traj: Trajectory) -> Evaluation:
-        evaluator = _evaluators.resolve(task, self.benchmark.default_evaluator, self.options.evaluator)
+        if task.task_id in self._evaluators:
+            evaluator = self._evaluators[task.task_id]
+        else:  # a task not in the benchmark (run_task called directly)
+            evaluator = _evaluators.resolve(task, self.benchmark.default_evaluator, override=self.options.evaluator)
         if traj.status != Status.SUCCESS.value and output is None:
             return Evaluation(False, 0.0, evaluator.name if evaluator else "completion",
                               {"reason": "run failed", "error": traj.error})

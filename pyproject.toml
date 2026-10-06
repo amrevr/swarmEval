@@ -20,13 +20,14 @@ dependencies = []
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
+parquet = ["pyarrow>=14"]
 dev = ["pytest>=7"]
 
 [project.scripts]
 swarmeval = "swarmeval.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["swarmeval*", "examples*"]
+include = ["swarmeval*"]  # the demo swarm ships as swarmeval.examples
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
