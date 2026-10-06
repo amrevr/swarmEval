@@ -8,3 +8,7 @@ runs/
 .pytest_cache/
 .DS_Store
 .idea/
+
+# local tooling: code-review-graph DB and git worktrees
+.code-review-graph/
+worktrees/
