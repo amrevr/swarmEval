@@ -299,17 +299,31 @@ class RunContext:
         with self._lock:
             self._error_origin.setdefault(id(exc), (exc, event_id))
 
+    def _origin_of(self, exc: BaseException) -> Optional[Tuple[BaseException, str]]:
+        """The first recorded event for ``exc`` or for an exception it wraps
+        (``raise X from e`` / an exception raised while handling ``e``)."""
+        seen: set = set()
+        e: Optional[BaseException] = exc
+        with self._lock:
+            while e is not None and id(e) not in seen:
+                seen.add(id(e))
+                origin = self._error_origin.get(id(e))
+                if origin is not None and origin[0] is e:
+                    return origin
+                e = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
+        return None
+
     def record_exception(self, exc: BaseException, _span: Optional["AgentSpan"] = None) -> Event:
         """Record an ERROR for ``exc``.  The first record of an exception counts
-        as the error; later ones (the same exception leaving enclosing spans
-        or the run) are marked ``propagated`` and point to the original, so
-        one failure is counted once regardless of nesting depth."""
+        as the error; later ones (the same exception, or one wrapping it,
+        leaving enclosing spans or the run) are marked ``propagated`` and point
+        to the original, so one failure is counted once regardless of nesting
+        depth or re-raising."""
         err = f"{type(exc).__name__}: {exc}"
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
-        with self._lock:
-            origin = self._error_origin.get(id(exc))
+        origin = self._origin_of(exc)
         meta: Dict[str, Any] = {}
-        if origin is not None and origin[0] is exc:
+        if origin is not None:
             meta = {"propagated": True, "origin_event_id": origin[1]}
         ev = self.record(EventType.ERROR, _span=_span, error=err,
                          content=self._text(tb) if self.capture_text else None, metadata=meta)

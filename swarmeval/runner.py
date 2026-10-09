@@ -58,17 +58,32 @@ def as_factory(swarm: Any) -> SwarmFactory:
     raise TypeError("swarm must be a Swarm, a factory() -> Swarm, or a run(task, ctx) function")
 
 
-def _await(aw: Any) -> Any:
-    """Run an async swarm's ``run`` coroutine to completion."""
+class UsageError(RuntimeError):
+    """SwarmEval was called incorrectly.  Unlike a swarm crash this is never
+    recorded as a run result; it propagates to the caller."""
+
+
+_LOOP_MSG = ("an async swarm cannot be evaluated from inside a running event loop; "
+             "call evaluate() from synchronous code (e.g. in a worker thread)")
+
+
+def _in_event_loop() -> bool:
     import asyncio
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        return False
+    return True
+
+
+def _await(aw: Any) -> Any:
+    """Run an async swarm's ``run`` coroutine to completion."""
+    import asyncio
+    if not _in_event_loop():
         return asyncio.run(_as_coro(aw))
     if inspect.iscoroutine(aw):
         aw.close()
-    raise RuntimeError("an async swarm cannot be evaluated from inside a running event loop; "
-                       "call evaluate() from synchronous code (e.g. in a worker thread)")
+    raise UsageError(_LOOP_MSG)
 
 
 async def _as_coro(aw: Any) -> Any:
@@ -175,6 +190,8 @@ class SwarmRunner:
         ctx = RunContext(task, clock=self._clock(), seed=seed, trial=trial, pricing=opts.pricing,
                          capture_text=opts.capture_text, max_text_chars=opts.max_text_chars)
         swarm = self.factory()
+        if inspect.iscoroutinefunction(getattr(swarm, "run", None)) and _in_event_loop():
+            raise UsageError(_LOOP_MSG)  # fail before recording anything
         ctx.start()
         output: Any = None
         status = Status.SUCCESS.value
@@ -187,6 +204,8 @@ class SwarmRunner:
                 ctx.set_output(output)
             else:
                 output = ctx.trajectory.final_output
+        except UsageError:  # misuse of SwarmEval, not a swarm failure: surface it
+            raise
         except Exception as exc:  # the swarm crashed -- that is a result, not a bug in SwarmEval
             status = Status.ERROR.value
             error = f"{type(exc).__name__}: {exc}"

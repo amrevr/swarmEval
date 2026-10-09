@@ -198,6 +198,30 @@ def test_async_swarm_is_awaited_and_recorded():
     assert traj.tool_calls()[0].content == ["hit"]
 
 
+def test_async_swarm_inside_running_loop_raises_instead_of_recording_a_crash():
+    from swarmeval.runner import UsageError
+
+    class AsyncSwarm(Swarm):
+        async def run(self, task, ctx):
+            return "42"
+
+    async def outer():
+        return evaluate(AsyncSwarm(), one_task())
+
+    with pytest.raises(UsageError, match="running event loop"):
+        asyncio.run(outer())
+
+    # the same when run() is sync but hands back a coroutine
+    async def body():
+        return "42"
+
+    async def outer2():
+        return evaluate(lambda task, ctx: body(), one_task())
+
+    with pytest.raises(UsageError, match="running event loop"):
+        asyncio.run(outer2())
+
+
 def test_sync_wrappers_reject_async_functions():
     async def model(prompt):
         return "x"
@@ -278,6 +302,24 @@ def test_one_exception_counts_as_one_error():
     assert eff.errors == 1 and sum(a.errors for a in eff.per_agent.values()) == 1
     errors = res.runs.trajectories[0].events_of(EventType.ERROR)
     assert len(errors) == 4 and sum(1 for e in errors if not e.metadata.get("propagated")) == 0
+
+
+def test_wrapped_exception_still_counts_as_one_error():
+    def swarm(task, ctx):
+        with ctx.agent("outer") as o:
+            try:
+                with o.sub_agent("inner") as i:
+                    i.call_tool("flaky", lambda: 1 / 0)
+            except ZeroDivisionError as e:
+                raise RuntimeError("wrapped") from e
+
+    res = evaluate(swarm, one_task())
+    eff = res.per_run[0]
+    assert eff.errors == 1 and {a: x.errors for a, x in eff.per_agent.items()} == {"outer": 0, "inner": 1}
+    errors = res.runs.trajectories[0].events_of(EventType.ERROR)
+    assert errors and all(e.metadata.get("propagated") for e in errors)
+    origin = {e.metadata["origin_event_id"] for e in errors}
+    assert origin == {res.runs.trajectories[0].tool_calls()[0].event_id}
 
 
 def test_llm_records_prompt_without_prompt_kwarg():
