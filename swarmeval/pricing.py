@@ -14,19 +14,32 @@ from typing import Dict, Optional, Sequence, Tuple
 # CACHE_READ_MULTIPLIER x input.
 Price = Tuple[float, ...]
 
-# Anthropic first-party API rates (cached 2026-09).
+# Anthropic first-party API rates, USD per 1M tokens.
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-13).
+# Cache reads are 0.1x input unless the model lists its own rate below.
+# Claude Haiku 5.5 is omitted: its price depends on prompt length (a lower
+# rate up to 100k tokens), which this flat table cannot express; add it via
+# PricingTable(custom=...) for the tier you use.
 DEFAULT_PRICES: Dict[str, Price] = {
     "claude-fable-5-1": (10.00, 50.00, 0.25),
     "claude-mythos-5-1": (10.00, 50.00, 0.25),
     "claude-fable-5": (10.00, 50.00),
+    "claude-mythos-5": (10.00, 50.00),
     "claude-opus-5-5": (4.00, 20.00, 0.20),
     "claude-opus-5": (5.00, 25.00),
     "claude-opus-4-8": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-6": (5.00, 25.00),
+    "claude-opus-4-5": (5.00, 25.00),
+    "claude-opus-4-1": (15.00, 75.00),
+    "claude-opus-4": (15.00, 75.00),
+    "claude-sonnet-5-5": (2.00, 10.00, 0.10),
     "claude-sonnet-5": (2.00, 10.00),
     "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-sonnet-4": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),
+    "claude-3-5-haiku": (0.80, 4.00),
 }
 
 # Prompt-cache rates relative to the input rate: 5-minute cache writes cost

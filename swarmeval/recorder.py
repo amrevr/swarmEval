@@ -313,6 +313,16 @@ class RunContext:
                 e = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
         return None
 
+    def _propagation_meta(self, exc: BaseException) -> Dict[str, Any]:
+        """Metadata for an event that records ``exc`` again: empty for the first
+        record, else ``propagated`` plus a pointer to the original event.  Used
+        for ERROR events and for failed LLM/tool calls that an exception passes
+        through (a tool calling a tool), so the metrics count it once."""
+        origin = self._origin_of(exc)
+        if origin is None:
+            return {}
+        return {"propagated": True, "origin_event_id": origin[1]}
+
     def record_exception(self, exc: BaseException, _span: Optional["AgentSpan"] = None) -> Event:
         """Record an ERROR for ``exc``.  The first record of an exception counts
         as the error; later ones (the same exception, or one wrapping it,
@@ -321,10 +331,7 @@ class RunContext:
         depth or re-raising."""
         err = f"{type(exc).__name__}: {exc}"
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
-        origin = self._origin_of(exc)
-        meta: Dict[str, Any] = {}
-        if origin is not None:
-            meta = {"propagated": True, "origin_event_id": origin[1]}
+        meta = self._propagation_meta(exc)
         ev = self.record(EventType.ERROR, _span=_span, error=err,
                          content=self._text(tb) if self.capture_text else None, metadata=meta)
         if not meta:
@@ -519,6 +526,7 @@ class AgentSpan:
         try:
             yield call
         except Exception as exc:
+            call.metadata.update(ctx._propagation_meta(exc))
             ev = self._record_llm(call, t0, Status.ERROR.value, f"{type(exc).__name__}: {exc}")
             ctx._mark_exception(exc, ev.event_id)
             raise
@@ -618,6 +626,7 @@ class AgentSpan:
         try:
             yield call
         except Exception as exc:
+            call.metadata.update(ctx._propagation_meta(exc))
             ev = self._record_tool(call, t0, Status.ERROR.value, f"{type(exc).__name__}: {exc}")
             ctx._mark_exception(exc, ev.event_id)
             raise
