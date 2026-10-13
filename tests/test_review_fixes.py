@@ -57,7 +57,7 @@ def test_partial_cost_is_marked_in_every_row():
 
 def test_saved_runs_can_be_repriced(tmp_path):
     def swarm(task, ctx):
-        with ctx.agent("a", model="claude-sonnet-4-5") as a:
+        with ctx.agent("a", model="acme-llm-1") as a:   # not in DEFAULT_PRICES
             a.llm(lambda: LLMResult("x", 200_000, 20_000))
         return "ok"
 
@@ -66,7 +66,7 @@ def test_saved_runs_can_be_repriced(tmp_path):
     path = tmp_path / "r.json"
     res.save(str(path))
     prices = tmp_path / "prices.json"
-    prices.write_text(json.dumps({"claude-sonnet-4-5": [3.0, 15.0]}))
+    prices.write_text(json.dumps({"acme-llm-1": [3.0, 15.0]}))
     repriced = analyze_runs(res.runs, pricing=PricingTable.load(str(prices)))
     assert repriced.cost["total"] == pytest.approx(0.9) and repriced.cost["complete"]
     assert main(["report", str(path), "--pricing", str(prices)]) == 0
@@ -87,8 +87,13 @@ def test_prompt_cache_tokens_are_priced():
     # sonnet-5: $2 in, $10 out; reads 0.1x, writes 1.25x
     assert p.cost("claude-sonnet-5", 100, 10, cache_read_tokens=1000, cache_write_tokens=1000) == pytest.approx(
         (100 * 2 + 10 * 10 + 1000 * 0.2 + 1000 * 2.5) / 1e6)
-    # opus-5-5 has its own cache-read rate
-    assert p.cost("claude-opus-5-5", 0, 0, cache_read_tokens=1_000_000) == pytest.approx(0.2)
+    # models with their own cache-read rate (official pricing page)
+    assert p.cost("claude-opus-5-5", 0, 0, cache_read_tokens=1_000_000) == pytest.approx(0.20)
+    assert p.cost("claude-sonnet-5-5", 0, 0, cache_read_tokens=1_000_000) == pytest.approx(0.10)
+    assert p.cost("claude-fable-5-1", 0, 0, cache_read_tokens=1_000_000) == pytest.approx(0.25)
+    # dated ids of older models resolve to the undated key
+    assert p.lookup("claude-opus-4-1-20250805") == (15.0, 75.0)
+    assert p.lookup("claude-3-5-haiku-20241022") == (0.8, 4.0)
 
 
 # -- evaluator specs -------------------------------------------------------- #
@@ -119,10 +124,12 @@ def test_caller_evaluator_overrides_benchmark_default():
     assert res.success_rate == 1.0
 
 
-def test_unserializable_evaluators_fail_clearly():
+def test_unserializable_evaluators_fail_clearly(tmp_path):
     bench = Benchmark("b", [Task("q", "what?", evaluator=lambda t, o, tr: True)])
+    target = tmp_path / "bench.json"
     with pytest.raises(ValueError, match="cannot be rebuilt"):
-        bench.save("/dev/null")
+        bench.save(str(target))
+    assert not target.exists()  # refused before writing anything
     reloaded = Benchmark.from_dict(json.loads(json.dumps(bench.to_dict())))
     with pytest.raises(ValueError, match="cannot be rebuilt"):
         reloaded.validate()
@@ -320,6 +327,38 @@ def test_wrapped_exception_still_counts_as_one_error():
     assert errors and all(e.metadata.get("propagated") for e in errors)
     origin = {e.metadata["origin_event_id"] for e in errors}
     assert origin == {res.runs.trajectories[0].tool_calls()[0].event_id}
+
+
+def test_exception_through_nested_tool_calls_counts_once():
+    """A tool that calls a tool: one ZeroDivisionError passes through both
+    wrappers.  Both calls stay visibly failed; the error is counted once."""
+    def swarm(task, ctx):
+        with ctx.agent("a") as a:
+            def inner():
+                return a.call_tool("inner", lambda: 1 / 0)
+            a.call_tool("outer", inner)
+
+    res = evaluate(swarm, one_task())
+    eff = res.per_run[0]
+    assert eff.errors == 1 and {k: v.errors for k, v in eff.per_agent.items()} == {"a": 1}
+    inner_ev, outer_ev = res.runs.trajectories[0].tool_calls()   # recorded innermost first
+    assert (inner_ev.tool_name, outer_ev.tool_name) == ("inner", "outer")
+    assert inner_ev.status == outer_ev.status == "error"
+    assert "propagated" not in inner_ev.metadata
+    assert outer_ev.metadata == {"propagated": True, "origin_event_id": inner_ev.event_id}
+
+
+def test_exception_through_llm_call_wrapping_a_tool_call_counts_once():
+    def swarm(task, ctx):
+        with ctx.agent("a") as a:
+            with a.llm_call(model="claude-sonnet-5"):
+                a.call_tool("t", lambda: 1 / 0)
+
+    res = evaluate(swarm, one_task())
+    eff = res.per_run[0]
+    assert eff.errors == 1 and eff.per_agent["a"].errors == 1
+    traj = res.runs.trajectories[0]
+    assert traj.llm_calls()[0].status == "error" and traj.llm_calls()[0].metadata["propagated"]
 
 
 def test_llm_records_prompt_without_prompt_kwarg():

@@ -86,6 +86,10 @@ def summarize_efficiency(trajectories: Sequence[Trajectory], effs: Sequence[Effi
         output_tokens=S(e.output_tokens for e in effs), llm_calls=S(e.llm_calls for e in effs),
         tool_calls=S(e.tool_calls for e in effs), messages=S(e.messages for e in effs),
         cost_usd=S(costs), cost_complete=cost_complete, cost_total=total_cost,
+        # Known cost divided by *all* successes.  When pricing is incomplete this
+        # understates the true figure (unpriced runs contribute nothing to the
+        # numerator but still count in the denominator); cost_complete=False
+        # flags it and the report marks it with "*".
         cost_per_success=(total_cost / successes) if successes and total_cost is not None else None,
         wall_clock_s=S(e.wall_clock_s for e in effs), agent_time_s=S(e.agent_time_s for e in effs),
         waiting_time_s=S(e.waiting_time_s for e in effs), errors=S(e.errors for e in effs), per_agent=per_agent)

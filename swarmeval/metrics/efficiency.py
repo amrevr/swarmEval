@@ -128,7 +128,9 @@ def compute_efficiency(traj: Trajectory, pricing: Optional[PricingTable] = None)
                     a.cost_complete = False
                 else:
                     a.cost_usd = (a.cost_usd or 0.0) + cost
-            if ev.status == "error":
+            if ev.status == "error" and not ev.metadata.get("propagated"):
+                # a failed call that an already-counted exception passed through
+                # (a tool calling a tool) stays visibly failed but is not re-counted
                 m.errors += 1
                 if ev.agent_id:
                     agent(ev.agent_id).errors += 1
@@ -139,7 +141,9 @@ def compute_efficiency(traj: Trajectory, pricing: Optional[PricingTable] = None)
                 busy[ev.span_id].append((ev.timestamp, ev.end_timestamp))
             if ev.agent_id:
                 agent(ev.agent_id).tool_calls += 1
-            if ev.status == "error":
+            if ev.status == "error" and not ev.metadata.get("propagated"):
+                # a failed call that an already-counted exception passed through
+                # (a tool calling a tool) stays visibly failed but is not re-counted
                 m.errors += 1
                 if ev.agent_id:
                     agent(ev.agent_id).errors += 1
