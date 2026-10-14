@@ -172,6 +172,17 @@ def test_tool_use_flags_forbidden_tool_even_when_it_failed():
     assert not r.success and r.details["forbidden"] == ["rm_rf"]
 
 
+
+def test_tool_use_counts_an_exception_through_nested_calls_once():
+    ctx = ctx_for()
+    with ctx.agent("a") as a:
+        with pytest.raises(ZeroDivisionError):
+            a.call_tool("outer", lambda: a.call_tool("inner", lambda: 1 / 0))
+    traj = ctx.finish()
+    assert compute_efficiency(traj).errors == 1
+    r = E.ToolUseEvaluator().evaluate(Task("t", "q"), "out", traj)
+    assert not r.success and r.details["errors"] == 1
+
 # -- runner ----------------------------------------------------------------- #
 def test_swarm_class_is_accepted_as_factory():
     class S(Swarm):
