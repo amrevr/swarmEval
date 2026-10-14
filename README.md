@@ -199,8 +199,6 @@ tests/
 
 ## Development
 
-Develop and test inside a container rather than installing dependencies on your machine. Mount the checkout and run the tests:
-
 ```bash
 docker run --rm -v "$PWD":/w -w /w python:3.12-slim \
   sh -c 'pip install -q -e ".[dev,parquet]" && pytest -q'
