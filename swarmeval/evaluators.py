@@ -214,7 +214,9 @@ class ToolUseEvaluator(Evaluator):
         attempted = {c.tool_name for c in calls}
         missing = [t for t in self.expected_tools if t not in used]
         forbidden = [t for t in self.forbidden_tools if t in attempted]  # a failed call is still a violation
-        errors = [c for c in calls if c.status == "error"]
+        # one exception passing through nested calls counts once, as in the
+        # efficiency metrics; the propagated calls are still failed events
+        errors = [c for c in calls if c.status == "error" and not c.metadata.get("propagated")]
         checks = [not missing, not forbidden, self.allow_errors or not errors]
         score = sum(checks) / len(checks)
         return Evaluation(all(checks), score, self.name,
