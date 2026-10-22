@@ -14,6 +14,7 @@ from .pricing import PricingTable
 from .recorder import Clock
 from .runner import RunOptions, RunSet, SwarmRunner
 from .schema import Benchmark, Trajectory
+from .diagnostics.smells import resolve_smell_config
 from .similarity import resolve_similarity
 from .stats import Summary, mean, summarize
 
@@ -215,7 +216,9 @@ def analyze_runs(runs: RunSet, pricing: Optional[PricingTable] = None, coordinat
     """Recompute the evaluation from trajectories (e.g. a saved RunSet).
     With ``pricing``, every LLM call is re-priced from its recorded model and
     token counts instead of using the cost stored at run time.
-    ``coordination=False`` skips the execution-graph analysis."""
+    ``coordination=False`` skips the execution-graph analysis; ``similarity``
+    is the artifact-redundancy backend and ``smell_config`` the smell
+    thresholds (``SmellConfig``, dict of overrides or JSON path)."""
     per_run = [compute_efficiency(t, pricing) for t in runs.trajectories]
     performance = compute_performance(runs.trajectories, per_run)
     efficiency = summarize_efficiency(runs.trajectories, per_run)
@@ -223,6 +226,7 @@ def analyze_runs(runs: RunSet, pricing: Optional[PricingTable] = None, coordinat
     coord_summary: Optional[CoordinationSummary] = None
     if coordination:
         similarity = resolve_similarity(similarity)   # once, not per run
+        smell_config = resolve_smell_config(smell_config)
         per_run_coord = [compute_coordination(t, similarity=similarity, smell_config=smell_config, efficiency=e)
                          for t, e in zip(runs.trajectories, per_run)]
         coord_summary = summarize_coordination(per_run_coord)
@@ -234,16 +238,19 @@ def evaluate(swarm: Any, benchmark: Benchmark, trials: int = 1, seed: int = 0, e
              clock_factory: Optional[Callable[[], Clock]] = None, pricing: Optional[PricingTable] = None,
              label: str = "baseline", progress: bool = False, raise_errors: bool = False,
              on_run: Optional[Callable[[Trajectory], None]] = None, capture_text: bool = True,
-             max_text_chars: int = 20000) -> EvaluationResult:
+             max_text_chars: int = 20000, coordination: bool = True, similarity: Any = None,
+             smell_config: Any = None) -> EvaluationResult:
     """Run ``swarm`` on ``benchmark`` ``trials`` times and return an EvaluationResult.
 
     ``swarm`` may be a Swarm instance or class, a ``factory() -> Swarm`` or a
     bare ``run(task, ctx)`` function (sync or async).  ``evaluator``, when
     given, overrides the task and benchmark evaluators.  ``capture_text=False``
     keeps only short previews of prompts, outputs and artifacts.
+    ``coordination``, ``similarity`` and ``smell_config`` are passed to
+    ``analyze_runs``.
     """
     opts = RunOptions(trials=trials, seed=seed, clock_factory=clock_factory, pricing=pricing, evaluator=evaluator,
                       progress=progress, raise_errors=raise_errors, on_run=on_run, capture_text=capture_text,
                       max_text_chars=max_text_chars)
     runs = SwarmRunner(swarm, benchmark, label=label, options=opts).run()
-    return analyze_runs(runs)
+    return analyze_runs(runs, coordination=coordination, similarity=similarity, smell_config=smell_config)
