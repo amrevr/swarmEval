@@ -14,6 +14,7 @@ from .pricing import PricingTable
 from .recorder import Clock
 from .runner import RunOptions, RunSet, SwarmRunner
 from .schema import Benchmark, Trajectory
+from .similarity import resolve_similarity
 from .stats import Summary, mean, summarize
 
 
@@ -221,6 +222,7 @@ def analyze_runs(runs: RunSet, pricing: Optional[PricingTable] = None, coordinat
     per_run_coord: Optional[List[CoordinationMetrics]] = None
     coord_summary: Optional[CoordinationSummary] = None
     if coordination:
+        similarity = resolve_similarity(similarity)   # once, not per run
         per_run_coord = [compute_coordination(t, similarity=similarity, smell_config=smell_config, efficiency=e)
                          for t, e in zip(runs.trajectories, per_run)]
         coord_summary = summarize_coordination(per_run_coord)
