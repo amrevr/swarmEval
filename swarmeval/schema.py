@@ -535,6 +535,10 @@ class Trajectory:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Trajectory":
+        metadata = dict(d.get("metadata", {}))
+        # loaded data went through the text policy: text may be gone for good
+        if not TextPolicy.from_metadata(metadata).capture:
+            metadata["text_truncated"] = True
         return cls(
             run_id=d["run_id"],
             task_id=d["task_id"],
@@ -551,7 +555,7 @@ class Trajectory:
             status=d.get("status", "success"),
             error=d.get("error"),
             evaluation=Evaluation.from_dict(d["evaluation"]) if d.get("evaluation") else None,
-            metadata=d.get("metadata", {}),
+            metadata=metadata,
         )
 
     def save(self, path: str) -> None:
