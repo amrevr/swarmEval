@@ -35,7 +35,7 @@ def test_attached_artifact_tokens_counted_once():
         llm(b, ctx.clock, tokens=(40, 10))
     traj = ctx.finish()
     ev = traj.messages()[0]
-    assert ev.content_tokens == 1005 and body_tokens(ev, traj) == 5
+    assert ev.content_tokens == 5 and ev.metadata["attached_tokens"] == 1000 and body_tokens(ev, traj) == 5
     cm = compute_communication(traj)
     assert cm.body_tokens == 5 and cm.attached_artifact_tokens == 1000
     assert cm.llm_tokens == 200
