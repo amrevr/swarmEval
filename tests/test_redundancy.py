@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from swarmeval import (EmbeddingSimilarity, LexicalSimilarity, RunContext, SimClock, Task, compute_redundancy,
-                       evaluate)
+from swarmeval import (EmbeddingSimilarity, LexicalSimilarity, RunContext, SimClock, Task, Trajectory,
+                       compute_redundancy, evaluate)
 from swarmeval.examples.research_swarm import build_benchmark, make_swarm
 from swarmeval.metrics import canonical_args, summarize_redundancy
 
@@ -128,8 +128,9 @@ def test_artifact_redundancy():
 
 
 def test_artifact_redundancy_degraded_without_text():
-    """Without captured text only exact hashes are compared: the near copy is missed."""
-    r = compute_redundancy(_artifacts(capture_text=False))
+    """Without captured text only exact hashes are compared: the near copy is missed.
+    The text is dropped when the run is saved, so this goes through a round trip."""
+    r = compute_redundancy(Trajectory.from_dict(_artifacts(capture_text=False).to_dict()))
     assert r.degraded and r.method == "hash" and r.similarity_threshold is None
     assert {p["name"] for p in r.redundant_artifact_pairs} == {"dup", "check"}
     assert r.redundant_artifacts == 1

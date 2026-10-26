@@ -158,16 +158,8 @@ def compute_communication(traj: Trajectory, graph: Optional[ExecutionGraph] = No
             out.broadcasts += 1
             out.broadcast_messages += fanout_counts[g]
 
-    # fan-in/out over message and artifact edges; invocation edges are
-    # control flow, not communication
-    outs: Dict[str, Set[str]] = defaultdict(set)
-    ins: Dict[str, Set[str]] = defaultdict(set)
-    for e in graph.agent_edges:
-        if e.kind in ("message", "artifact") and e.source != e.target:
-            outs[e.source].add(e.target)
-            ins[e.target].add(e.source)
     for a, ac in per_agent.items():
-        ac.fan_out, ac.fan_in = len(outs.get(a, ())), len(ins.get(a, ()))
+        ac.fan_out, ac.fan_in = graph.fan_out(a), graph.fan_in(a)
         ac.relay_fraction = ac.relayed_messages / ac.messages_sent if ac.messages_sent else None
     out.per_agent = per_agent
 

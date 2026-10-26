@@ -23,7 +23,7 @@ import inspect
 import math
 import re
 from collections import defaultdict
-from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Protocol, Sequence, Set, Tuple,
+from typing import (Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional, Protocol, Sequence, Set, Tuple,
                     runtime_checkable)
 
 Pair = Tuple[int, int]
@@ -68,14 +68,18 @@ def jaccard(a: Set[Any], b: Set[Any]) -> float:
 class LexicalSimilarity:
     """Jaccard similarity of lowercase word ``shingle``-grams.  A pair where
     either text has fewer than ``shingle`` words is compared on word sets
-    instead (a 2-word text has no 3-shingles to share)."""
+    instead (a 2-word text has no 3-shingles to share).  Candidates are capped
+    at ``max_pairs`` (``truncated`` is then True and later pairs are not
+    compared, so redundancy can be under-counted)."""
     name = "lexical"
 
-    def __init__(self, threshold: float = 0.6, shingle: int = 3) -> None:
+    def __init__(self, threshold: float = 0.6, shingle: int = 3, max_pairs: int = 200000) -> None:
         if shingle < 1:
             raise ValueError("shingle must be >= 1")
         self.threshold = threshold
         self.shingle = shingle
+        self.max_pairs = max_pairs
+        self.truncated = False
 
     def _features(self, texts: Sequence[str]) -> Tuple[List[Set[str]], List[FrozenSet[Tuple[str, ...]]]]:
         uni, shingles = [], []
@@ -94,26 +98,35 @@ class LexicalSimilarity:
         """Pairs sharing at least one shingle (or, involving a short text, one
         word), found through an inverted index rather than all pairs."""
         uni, shingles = self._features(texts)
-        out: Set[Pair] = set()
         by_shingle: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
         for i, sh in enumerate(shingles):
             for s in sh:
                 by_shingle[s].append(i)
-        for posting in by_shingle.values():
-            for x in range(len(posting)):
-                for y in range(x + 1, len(posting)):
-                    out.add((posting[x], posting[y]))
-        short = [i for i, sh in enumerate(shingles) if not sh and uni[i]]
-        if short:
-            by_word: Dict[str, List[int]] = defaultdict(list)
-            for i, ws in enumerate(uni):
-                for w in ws:
-                    by_word[w].append(i)
-            for i in short:
-                for w in uni[i]:
-                    for j in by_word[w]:
-                        if j != i:
-                            out.add((min(i, j), max(i, j)))
+
+        def generate() -> Iterator[Pair]:
+            for posting in by_shingle.values():
+                for x in range(len(posting)):
+                    for y in range(x + 1, len(posting)):
+                        yield (posting[x], posting[y])
+            short = [i for i, sh in enumerate(shingles) if not sh and uni[i]]
+            if short:
+                by_word: Dict[str, List[int]] = defaultdict(list)
+                for i, ws in enumerate(uni):
+                    for w in ws:
+                        by_word[w].append(i)
+                for i in short:
+                    for w in uni[i]:
+                        for j in by_word[w]:
+                            if j != i:
+                                yield (min(i, j), max(i, j))
+
+        self.truncated = False
+        out: Set[Pair] = set()
+        for pair in generate():
+            if len(out) >= self.max_pairs and pair not in out:
+                self.truncated = True
+                break
+            out.add(pair)
         return sorted(out)
 
     def scores(self, texts: Sequence[str], pairs: Sequence[Pair]) -> List[float]:
@@ -127,7 +140,7 @@ class LexicalSimilarity:
         return out
 
     def __repr__(self) -> str:
-        return f"LexicalSimilarity(threshold={self.threshold}, shingle={self.shingle})"
+        return f"LexicalSimilarity(threshold={self.threshold}, shingle={self.shingle}, max_pairs={self.max_pairs})"
 
 
 # --------------------------------------------------------------------------- #

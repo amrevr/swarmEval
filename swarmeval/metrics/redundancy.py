@@ -199,7 +199,7 @@ def _artifact_redundancy(traj: Trajectory, out: RedundancyMetrics, similarity: A
     out.artifacts = len(arts)
     if not arts:
         return
-    captured = traj.metadata.get("capture_text", True) is not False and all(a.content is not None for a in arts)
+    captured = not traj.metadata.get("text_truncated") and all(a.content is not None for a in arts)
     out.degraded = not captured
     sim = None if out.degraded else resolve_similarity(similarity)
     out.method = sim.name if sim is not None else "hash"
