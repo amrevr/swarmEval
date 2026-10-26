@@ -27,9 +27,6 @@ class Evaluator:
         """Raise ``ValueError`` if this evaluator cannot judge ``task`` (e.g. it
         has nothing to compare against).  Called by ``Benchmark.validate``."""
 
-    def __call__(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
-        return self.evaluate(task, output, trajectory)
-
 
 # --------------------------------------------------------------------------- #
 # Deterministic evaluators
@@ -256,6 +253,8 @@ class Composite(Evaluator):
     def __init__(self, evaluators: Sequence[Evaluator], weights: Optional[Sequence[float]] = None,
                  threshold: float = 0.5, required: Sequence[str] = ()) -> None:
         self.evaluators = list(evaluators)
+        if weights and len(weights) != len(self.evaluators):
+            raise ValueError(f"composite got {len(weights)} weights for {len(self.evaluators)} evaluators")
         self.weights = list(weights) if weights else [1.0] * len(self.evaluators)
         self.threshold = threshold
         self.required = list(required)
