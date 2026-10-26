@@ -1,41 +1,15 @@
 """Regression tests for rohitp30's review nits on PR #4 (and the fan-in/out
-note on PR #3, whose second definition lives here)."""
-import os
-
+note on PR #3, whose second definition lives here).  Recording message body
+tokens at the source is held for rohitp30's answer on PR #4."""
 from swarmeval import (EvaluationResult, LexicalSimilarity, RunContext, SimClock, Task, build_graph,
-                       compute_communication, compute_efficiency, compute_redundancy, evaluate)
-from swarmeval.evaluate import load_runset
+                       compute_communication, compute_redundancy, evaluate)
 from swarmeval.examples.research_swarm import build_benchmark, make_swarm
-from swarmeval.metrics.communication import body_tokens
-
-FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "phase1_runs.json")
 
 
 def make_ctx():
     ctx = RunContext(Task("t", "q"), clock=SimClock(), seed=0)
     ctx.start()
     return ctx
-
-
-# -- message tokens: one definition, recorded at the source ------------------- #
-def test_artifact_sent_twice_is_not_counted_as_message_tokens():
-    ctx = make_ctx()
-    with ctx.agent("a") as a:
-        art = a.produce("big", "x" * 4000)                 # 1000 tokens
-        a.send("b", "y" * 20, artifacts=[art])             # 5-token body
-        a.send("c", "y" * 20, artifacts=[art])
-    traj = ctx.finish()
-    for ev in traj.messages():
-        assert ev.content_tokens == 5 and ev.metadata["attached_tokens"] == 1000
-    assert compute_efficiency(traj).message_tokens == 10
-
-
-def test_legacy_messages_count_body_only():
-    """Saved before the fix: content_tokens still include attachments.
-    Run 0 of the Phase 1 fixture has 728 recorded, 295 body tokens."""
-    traj = load_runset(FIXTURE).trajectories[0]
-    assert sum(body_tokens(m, traj) for m in traj.messages()) == 295
-    assert compute_efficiency(traj).message_tokens == 295
 
 
 # -- fan-in / fan-out: the graph and communication agree ---------------------- #
