@@ -18,19 +18,33 @@ Definitions:
 * **hub share** = the largest share of messages any one agent was party to
   (as sender or receiver).  A star topology, where every message goes to or
   from one hub, has hub share 1.0.
+
+Classes:
+- AgentCommunication: One agent's part in the run's messaging. ``fan_out`` / ``fan_in`` count distinct other agents
+  it sent to / received from, over messages and artifact consumption. ``relay_fraction`` = messages it sent carrying
+  an artifact produced by another agent ÷ messages it sent (``None`` if it sent none): high values mark an agent
+  passing others' work along.
+- CommunicationMetrics: Communication overhead of one run (see the module docstring for the definitions).
+  ``by_category`` maps coordination / information / work_product / other to ``{"messages", "body_tokens"}``.
+  ``repeated_messages`` counts extra copies of a (sender, receiver, content) already sent; ``broadcasts`` counts one
+  content sent from one span to two or more receivers (``broadcast_messages`` the messages involved).
+  ``used_edge_ratio`` = messages the receiver used ÷ messages, of which ``used_inferred`` were judged used by timing
+  alone.
+- CommunicationSummary: Communication metrics over runs. Ratio summaries cover the runs where the ratio is defined
+  (``n``); ``None`` when no run defined it. ``hub_agents`` counts how often each agent was the hub.
 """
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any
 
 from ..graph.builder import ExecutionGraph, build_graph
 from ..schema import EventType, MessageKind, Trajectory
 from ..stats import Summary, mean, summarize
 
-# Message kinds grouped by what the message does for the run.
-CATEGORIES: Dict[str, str] = {
+CATEGORIES: dict[str, str] = {
     MessageKind.TASK_ASSIGNMENT.value: "coordination",
     MessageKind.COORDINATION.value: "coordination",
     MessageKind.REQUEST.value: "coordination",
@@ -41,17 +55,13 @@ CATEGORIES: Dict[str, str] = {
 CATEGORY_NAMES = ("coordination", "information", "work_product", "other")
 
 
-def message_category(kind: Optional[str]) -> str:
+def message_category(kind: str | None) -> str:
+    """Category of a message kind: coordination, information, work_product or other."""
     return CATEGORIES.get(kind or "", "other")
 
 
 @dataclass
 class AgentCommunication:
-    """One agent's part in the run's messaging.  ``fan_out`` / ``fan_in``
-    count distinct other agents it sent to / received from, over messages and
-    artifact consumption.  ``relay_fraction`` = messages it sent carrying an
-    artifact produced by another agent ÷ messages it sent (``None`` if it sent
-    none): high values mark an agent passing others' work along."""
     agent_id: str
     messages_sent: int = 0
     messages_received: int = 0
@@ -59,55 +69,48 @@ class AgentCommunication:
     fan_out: int = 0
     fan_in: int = 0
     relayed_messages: int = 0
-    relay_fraction: Optional[float] = None
+    relay_fraction: float | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The record as a JSON-ready dict."""
         return asdict(self)
 
 
 @dataclass
 class CommunicationMetrics:
-    """Communication overhead of one run (see the module docstring for the
-    definitions).  ``by_category`` maps coordination / information /
-    work_product / other to ``{"messages", "body_tokens"}``.
-    ``repeated_messages`` counts extra copies of a (sender, receiver, content)
-    already sent; ``broadcasts`` counts one content sent from one span to two
-    or more receivers (``broadcast_messages`` the messages involved).
-    ``used_edge_ratio`` = messages the receiver used ÷ messages, of which
-    ``used_inferred`` were judged used by timing alone."""
     messages: int = 0
     body_tokens: int = 0
     attached_artifact_tokens: int = 0
     llm_tokens: int = 0
-    comm_work_ratio: Optional[float] = None
-    by_category: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    comm_work_ratio: float | None = None
+    by_category: dict[str, dict[str, int]] = field(default_factory=dict)
     repeated_messages: int = 0
     broadcasts: int = 0
     broadcast_messages: int = 0
-    per_agent: Dict[str, AgentCommunication] = field(default_factory=dict)
-    hub_agent: Optional[str] = None
-    hub_share: Optional[float] = None
+    per_agent: dict[str, AgentCommunication] = field(default_factory=dict)
+    hub_agent: str | None = None
+    hub_share: float | None = None
     used_messages: int = 0
     used_inferred: int = 0
-    used_edge_ratio: Optional[float] = None
-    receive_delay_mean_s: Optional[float] = None
-    receive_delay_max_s: Optional[float] = None
+    used_edge_ratio: float | None = None
+    receive_delay_mean_s: float | None = None
+    receive_delay_max_s: float | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The metrics as a JSON-ready dict."""
         d = asdict(self)
         d["per_agent"] = {k: v.to_dict() for k, v in self.per_agent.items()}
         return d
 
 
 def body_tokens(ev: Any, traj: Trajectory) -> int:
-    """A message's own tokens: ``content_tokens`` minus attached artifacts
-    (which the recorder folded in).  Clamped at 0 in case the record was
-    made by hand or an artifact's tokens were re-estimated."""
+    """A message's own tokens: ``content_tokens`` minus its attached artifacts' tokens, clamped at 0."""
     attached = sum(traj.artifacts[a].tokens for a in ev.input_artifacts if a in traj.artifacts)
     return max(0, ev.content_tokens - attached)
 
 
-def compute_communication(traj: Trajectory, graph: Optional[ExecutionGraph] = None) -> CommunicationMetrics:
+def compute_communication(traj: Trajectory, graph: ExecutionGraph | None = None) -> CommunicationMetrics:
+    """Communication overhead of one run."""
     graph = graph or build_graph(traj)
     msgs = traj.messages()
     out = CommunicationMetrics(messages=len(msgs))
@@ -116,7 +119,7 @@ def compute_communication(traj: Trajectory, graph: Optional[ExecutionGraph] = No
     llm_tokens = sum(e.prompt_tokens + e.output_tokens for e in traj.llm_calls())
     out.llm_tokens = llm_tokens
 
-    per_agent: Dict[str, AgentCommunication] = {a: AgentCommunication(a) for a in graph.agents}
+    per_agent: dict[str, AgentCommunication] = {a: AgentCommunication(a) for a in graph.agents}
 
     def agent(a: str) -> AgentCommunication:
         if a not in per_agent:
@@ -124,7 +127,7 @@ def compute_communication(traj: Trajectory, graph: Optional[ExecutionGraph] = No
         return per_agent[a]
 
     repeats: Counter = Counter()
-    fanout_groups: Dict[Tuple[Any, ...], Set[str]] = defaultdict(set)
+    fanout_groups: dict[tuple[Any, ...], set[str]] = defaultdict(set)
     fanout_counts: Counter = Counter()
     involvement: Counter = Counter()
     for ev in msgs:
@@ -139,7 +142,6 @@ def compute_communication(traj: Trajectory, graph: Optional[ExecutionGraph] = No
             g = (ev.sender, ev.span_id, ev.content_hash)
             fanout_groups[g].add(ev.receiver)
             fanout_counts[g] += 1
-        # an agent messaging itself is involved once, not twice
         for a in {ev.sender, ev.receiver} - {None}:
             involvement[a] += 1
         if ev.sender is not None:
@@ -181,39 +183,39 @@ def compute_communication(traj: Trajectory, graph: Optional[ExecutionGraph] = No
     return out
 
 
-def _known(values: Sequence[Optional[float]]) -> Optional[Summary]:
+def _known(values: Sequence[float | None]) -> Summary | None:
+    """Summary of the defined values, None when there are none."""
     known = [v for v in values if v is not None]
     return summarize(known) if known else None
 
 
 @dataclass
 class CommunicationSummary:
-    """Communication metrics over runs.  Ratio summaries cover the runs where
-    the ratio is defined (``n``); ``None`` when no run defined it.
-    ``hub_agents`` counts how often each agent was the hub."""
     n_runs: int
     messages: Summary
     body_tokens: Summary
-    comm_work_ratio: Optional[Summary]
-    hub_share: Optional[Summary]
-    used_edge_ratio: Optional[Summary]
+    comm_work_ratio: Summary | None
+    hub_share: Summary | None
+    used_edge_ratio: Summary | None
     repeated_messages: Summary
     broadcasts: Summary
-    receive_delay_mean_s: Optional[Summary]
-    by_category: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    hub_agents: Dict[str, int] = field(default_factory=dict)
-    per_agent: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    receive_delay_mean_s: Summary | None
+    by_category: dict[str, dict[str, float]] = field(default_factory=dict)
+    hub_agents: dict[str, int] = field(default_factory=dict)
+    per_agent: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The summary as a JSON-ready dict."""
         return {k: (v.to_dict() if isinstance(v, Summary) else v) for k, v in self.__dict__.items()}
 
 
 def summarize_communication(per_run: Sequence[CommunicationMetrics]) -> CommunicationSummary:
+    """Communication metrics over runs."""
     S = summarize
     by_cat = {c: {"messages": mean([r.by_category.get(c, {}).get("messages", 0) for r in per_run]),
                   "body_tokens": mean([r.by_category.get(c, {}).get("body_tokens", 0) for r in per_run])}
               for c in CATEGORY_NAMES} if per_run else {}
-    acc: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    acc: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for r in per_run:
         for aid, ac in r.per_agent.items():
             for k in ("messages_sent", "messages_received", "body_tokens_sent", "fan_out", "fan_in"):

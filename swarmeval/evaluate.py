@@ -1,60 +1,69 @@
-"""Top-level evaluation: run a swarm on a benchmark and summarise the result."""
+"""Top-level evaluation: run a swarm on a benchmark and summarise the result.
+
+Unknown costs stay unknown: they are left out of sums and flagged via ``cost_complete``, never counted as $0.
+Cost per successful task is known cost divided by all successes, so with incomplete pricing it understates the
+true figure; ``cost_complete=False`` flags this and the report marks it with "*".
+
+Classes:
+- EfficiencySummary: Efficiency metrics aggregated over all runs in a RunSet.
+- EvaluationResult: Performance, efficiency and (when computed) coordination of one swarm on one benchmark.
+  ``per_run_coordination`` / ``coordination`` are ``None`` when the analysis was switched off.
+"""
 from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable
 
-from .metrics.coordination import (CoordinationMetrics, CoordinationSummary, compute_coordination,
-                                   summarize_coordination)
+from .diagnostics.smells import resolve_smell_config
+from .metrics.coordination import CoordinationMetrics, CoordinationSummary, compute_coordination, summarize_coordination
 from .metrics.efficiency import EfficiencyMetrics, compute_efficiency
 from .metrics.performance import PerformanceMetrics, compute_performance
 from .pricing import PricingTable
 from .recorder import Clock
 from .runner import RunOptions, RunSet, SwarmRunner
 from .schema import Benchmark, Trajectory
-from .diagnostics.smells import resolve_smell_config
 from .similarity import resolve_similarity
 from .stats import Summary, mean, summarize
 
 
 @dataclass
 class EfficiencySummary:
-    """Efficiency metrics aggregated over all runs in a RunSet."""
     tokens: Summary
     input_tokens: Summary
     output_tokens: Summary
     llm_calls: Summary
     tool_calls: Summary
     messages: Summary
-    cost_usd: Summary                 # over runs whose cost is known (n says how many)
+    cost_usd: Summary
     cost_complete: bool
-    cost_total: Optional[float]       # None when no run could be priced
-    cost_per_success: Optional[float]
+    cost_total: float | None
+    cost_per_success: float | None
     wall_clock_s: Summary
     agent_time_s: Summary
     waiting_time_s: Summary
     errors: Summary
-    per_agent: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    per_agent: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The summary as a JSON-ready dict."""
         return {k: (v.to_dict() if isinstance(v, Summary) else v) for k, v in self.__dict__.items()}
 
 
 def summarize_efficiency(trajectories: Sequence[Trajectory], effs: Sequence[EfficiencyMetrics]) -> EfficiencySummary:
+    """Efficiency over runs; unknown costs are left out of sums and flagged incomplete."""
     S = summarize
-    # Unknown costs stay unknown: they are left out of sums and flagged via
-    # cost_complete, never counted as $0.
     cost_complete = all(e.cost_complete for e in effs)
     costs = [e.cost_usd for e in effs if e.cost_usd is not None]
-    total_cost: Optional[float] = sum(costs) if costs else None
+    total_cost: float | None = sum(costs) if costs else None
     successes = sum(1 for t in trajectories if t.succeeded)
-    per_agent: Dict[str, Dict[str, Any]] = {}
-    agent_runs: Dict[str, int] = Counter()
-    roles: Dict[str, Optional[str]] = {}
-    agent_cost_complete: Dict[str, bool] = {}
-    acc: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    per_agent: dict[str, dict[str, Any]] = {}
+    agent_runs: dict[str, int] = Counter()
+    roles: dict[str, str | None] = {}
+    agent_cost_complete: dict[str, bool] = {}
+    acc: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for e in effs:
         for aid, ae in e.per_agent.items():
             agent_runs[aid] += 1
@@ -90,23 +99,16 @@ def summarize_efficiency(trajectories: Sequence[Trajectory], effs: Sequence[Effi
         output_tokens=S(e.output_tokens for e in effs), llm_calls=S(e.llm_calls for e in effs),
         tool_calls=S(e.tool_calls for e in effs), messages=S(e.messages for e in effs),
         cost_usd=S(costs), cost_complete=cost_complete, cost_total=total_cost,
-        # Known cost divided by *all* successes.  When pricing is incomplete this
-        # understates the true figure (unpriced runs contribute nothing to the
-        # numerator but still count in the denominator); cost_complete=False
-        # flags it and the report marks it with "*".
         cost_per_success=(total_cost / successes) if successes and total_cost is not None else None,
         wall_clock_s=S(e.wall_clock_s for e in effs), agent_time_s=S(e.agent_time_s for e in effs),
         waiting_time_s=S(e.waiting_time_s for e in effs), errors=S(e.errors for e in effs), per_agent=per_agent)
 
 
 class EvaluationResult:
-    """Performance, efficiency and (when computed) coordination of one swarm
-    on one benchmark.  ``per_run_coordination`` / ``coordination`` are
-    ``None`` when the analysis was switched off."""
 
-    def __init__(self, runs: RunSet, per_run: List[EfficiencyMetrics], performance: PerformanceMetrics,
-                 efficiency: EfficiencySummary, per_run_coordination: Optional[List[CoordinationMetrics]] = None,
-                 coordination: Optional[CoordinationSummary] = None) -> None:
+    def __init__(self, runs: RunSet, per_run: list[EfficiencyMetrics], performance: PerformanceMetrics,
+                 efficiency: EfficiencySummary, per_run_coordination: list[CoordinationMetrics] | None = None,
+                 coordination: CoordinationSummary | None = None) -> None:
         self.runs = runs
         self.per_run = per_run
         self.performance = performance
@@ -116,18 +118,21 @@ class EvaluationResult:
 
     @property
     def label(self) -> str:
+        """Label of the evaluated configuration."""
         return self.runs.label
 
     @property
     def benchmark(self) -> str:
+        """Name of the benchmark."""
         return self.runs.benchmark_name
 
     @property
     def success_rate(self) -> float:
+        """Share of runs that succeeded."""
         return self.performance.success_rate
 
     @property
-    def cost(self) -> Dict[str, Any]:
+    def cost(self) -> dict[str, Any]:
         """Known cost; values are ``None`` when nothing could be priced and
         ``complete`` is False when some calls were unpriced."""
         per_run = self.efficiency.cost_usd.mean if self.efficiency.cost_usd.n else None
@@ -135,29 +140,33 @@ class EvaluationResult:
                 "per_success": self.efficiency.cost_per_success, "complete": self.efficiency.cost_complete}
 
     @property
-    def latency(self) -> Dict[str, float]:
+    def latency(self) -> dict[str, float]:
+        """Mean wall-clock, agent and waiting time per run."""
         return {"wall_clock": self.efficiency.wall_clock_s.mean, "agent_time": self.efficiency.agent_time_s.mean,
                 "waiting": self.efficiency.waiting_time_s.mean}
 
     @property
-    def agents(self) -> List[str]:
+    def agents(self) -> list[str]:
+        """Agents seen in any run."""
         return list(self.efficiency.per_agent.keys())
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
+        """Headline numbers of the evaluation."""
         return {
             "label": self.label, "benchmark": self.benchmark, "runs": len(self.runs),
             "tasks": self.performance.n_tasks, "trials": self.performance.trials,
             "success_rate": round(self.success_rate, 4),
             "mean_score": round(self.performance.mean_score, 4),
             "run_errors": self.performance.run_errors,
-            "cost": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in self.cost.items()},  # None = unknown
+            "cost": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in self.cost.items()},
             "latency": {k: round(v, 3) for k, v in self.latency.items()},
             "tokens_per_run": round(self.efficiency.tokens.mean, 1),
             "agents": self.agents,
         }
 
-    def to_dict(self, include_runs: bool = False) -> Dict[str, Any]:
-        coord: List[Optional[CoordinationMetrics]] = (list(self.per_run_coordination)
+    def to_dict(self, include_runs: bool = False) -> dict[str, Any]:
+        """The result as a JSON-ready dict, with the run set when ``include_runs``."""
+        coord: list[CoordinationMetrics | None] = (list(self.per_run_coordination)
                                                       if self.per_run_coordination is not None
                                                       else [None] * len(self.per_run))
         d = {
@@ -169,7 +178,6 @@ class EvaluationResult:
                          "success": t.succeeded, "score": t.score, "cost_usd": e.cost_usd,
                          "tokens": e.total_tokens, "llm_calls": e.llm_calls, "tool_calls": e.tool_calls,
                          "wall_clock_s": e.wall_clock_s,
-                         # None (not []) when coordination was not computed
                          "dead_agents": c.dead_agents if c is not None else None,
                          "message_receive_coverage": (c.coverage.message_receive_coverage
                                                       if c is not None else None)}
@@ -180,15 +188,17 @@ class EvaluationResult:
         return d
 
     def save(self, path: str, include_runs: bool = True) -> None:
+        """Write the result as JSON, including trajectories by default."""
         with open(path, "w") as f:
             json.dump(self.to_dict(include_runs=include_runs), f, indent=1, default=str)
 
     @classmethod
-    def load(cls, path: str, pricing: Optional[PricingTable] = None) -> "EvaluationResult":
+    def load(cls, path: str, pricing: PricingTable | None = None) -> EvaluationResult:
         """Reload a saved result (re-priced with ``pricing`` if given)."""
         return analyze_runs(load_runset(path), pricing=pricing)
 
     def report(self, **kwargs: Any) -> str:
+        """The result as a text report."""
         from .report.text import render_text
         return render_text(self, **kwargs)
 
@@ -211,21 +221,17 @@ def load_runset(path: str) -> RunSet:
     raise ValueError(f"{path} has no trajectories; save with include_runs=True to reload")
 
 
-def analyze_runs(runs: RunSet, pricing: Optional[PricingTable] = None, coordination: bool = True,
+def analyze_runs(runs: RunSet, pricing: PricingTable | None = None, coordination: bool = True,
                  similarity: Any = None, smell_config: Any = None) -> EvaluationResult:
-    """Recompute the evaluation from trajectories (e.g. a saved RunSet).
-    With ``pricing``, every LLM call is re-priced from its recorded model and
-    token counts instead of using the cost stored at run time.
-    ``coordination=False`` skips the execution-graph analysis; ``similarity``
-    is the artifact-redundancy backend and ``smell_config`` the smell
-    thresholds (``SmellConfig``, dict of overrides or JSON path)."""
+    """Recompute the evaluation from trajectories, re-pricing every LLM call when ``pricing`` is given.
+    ``coordination=False`` skips graph analysis; ``similarity`` and ``smell_config`` tune it."""
     per_run = [compute_efficiency(t, pricing) for t in runs.trajectories]
     performance = compute_performance(runs.trajectories, per_run)
     efficiency = summarize_efficiency(runs.trajectories, per_run)
-    per_run_coord: Optional[List[CoordinationMetrics]] = None
-    coord_summary: Optional[CoordinationSummary] = None
+    per_run_coord: list[CoordinationMetrics] | None = None
+    coord_summary: CoordinationSummary | None = None
     if coordination:
-        similarity = resolve_similarity(similarity)   # once, not per run
+        similarity = resolve_similarity(similarity)
         smell_config = resolve_smell_config(smell_config)
         per_run_coord = [compute_coordination(t, similarity=similarity, smell_config=smell_config, efficiency=e)
                          for t, e in zip(runs.trajectories, per_run)]
@@ -235,20 +241,13 @@ def analyze_runs(runs: RunSet, pricing: Optional[PricingTable] = None, coordinat
 
 
 def evaluate(swarm: Any, benchmark: Benchmark, trials: int = 1, seed: int = 0, evaluator: Any = None,
-             clock_factory: Optional[Callable[[], Clock]] = None, pricing: Optional[PricingTable] = None,
+             clock_factory: Callable[[], Clock] | None = None, pricing: PricingTable | None = None,
              label: str = "baseline", progress: bool = False, raise_errors: bool = False,
-             on_run: Optional[Callable[[Trajectory], None]] = None, capture_text: bool = True,
+             on_run: Callable[[Trajectory], None] | None = None, capture_text: bool = True,
              max_text_chars: int = 20000, coordination: bool = True, similarity: Any = None,
              smell_config: Any = None) -> EvaluationResult:
-    """Run ``swarm`` on ``benchmark`` ``trials`` times and return an EvaluationResult.
-
-    ``swarm`` may be a Swarm instance or class, a ``factory() -> Swarm`` or a
-    bare ``run(task, ctx)`` function (sync or async).  ``evaluator``, when
-    given, overrides the task and benchmark evaluators.  ``capture_text=False``
-    keeps only short previews of prompts, outputs and artifacts.
-    ``coordination``, ``similarity`` and ``smell_config`` are passed to
-    ``analyze_runs``.
-    """
+    """Run ``swarm`` (instance, class, factory or sync/async ``run(task, ctx)``) on ``benchmark`` ``trials`` times.
+    ``evaluator`` overrides task evaluators; ``capture_text=False`` keeps only short text previews."""
     opts = RunOptions(trials=trials, seed=seed, clock_factory=clock_factory, pricing=pricing, evaluator=evaluator,
                       progress=progress, raise_errors=raise_errors, on_run=on_run, capture_text=capture_text,
                       max_text_chars=max_text_chars)
