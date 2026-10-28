@@ -3,11 +3,20 @@ import json
 
 import pytest
 
-from swarmeval import LexicalSimilarity, RunContext, RunSet, SimClock, Task, analyze_runs, cli, evaluate, \
-    render_coordination
+from swarmeval import (
+    LexicalSimilarity,
+    RunContext,
+    RunSet,
+    SimClock,
+    Task,
+    analyze_runs,
+    cli,
+    evaluate,
+    render_coordination,
+)
 from swarmeval.examples.research_swarm import build_benchmark, make_swarm
 
-HUB = "research_coordinator_agent_07"   # long enough that "100% (<id>)" passes the old 30-char value slice
+HUB = "research_coordinator_agent_07"
 
 
 def hub_run():
@@ -23,19 +32,17 @@ def hub_run():
     return analyze_runs(RunSet("l", "b", [ctx.finish()]))
 
 
-# -- long agent ids are not cut off -------------------------------------------- #
 def test_hub_share_row_keeps_long_agent_id():
-    (line,) = [l for l in render_coordination(hub_run()).splitlines() if "Hub Share" in l]
+    (line,) = [ln for ln in render_coordination(hub_run()).splitlines() if "Hub Share" in ln]
     assert HUB in line
 
 
 def test_contribution_row_keeps_long_agent_id():
     text = render_coordination(hub_run())
     section = text.split("OBSERVED CONTRIBUTION", 1)[1]
-    assert any(l.startswith("  " + HUB + " ") for l in section.splitlines())
+    assert any(ln.startswith("  " + HUB + " ") for ln in section.splitlines())
 
 
-# -- `swarmeval graph` honours the same analysis options as `report` ------------ #
 @pytest.fixture
 def saved_demo(tmp_path):
     path = str(tmp_path / "r.json")

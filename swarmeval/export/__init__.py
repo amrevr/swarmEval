@@ -1,4 +1,6 @@
-from typing import Iterable, Union
+"""Event-stream export: one record per event as JSONL or Parquet, picked by format or file extension."""
+from collections.abc import Iterable
+from typing import Union
 
 from ..schema import Trajectory
 from .jsonl import read_events_jsonl, write_events_jsonl

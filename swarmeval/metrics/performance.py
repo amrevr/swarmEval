@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 from ..schema import Trajectory
 from ..stats import mean
@@ -17,14 +18,15 @@ class PerformanceMetrics:
     n_successes: int = 0
     success_rate: float = 0.0
     mean_score: float = 0.0
-    constraint_pass_rate: Optional[float] = None
+    constraint_pass_rate: float | None = None
     run_errors: int = 0
     evaluator_errors: int = 0
-    per_task: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    per_trial: List[float] = field(default_factory=list)
-    evaluators: List[str] = field(default_factory=list)
+    per_task: dict[str, dict[str, Any]] = field(default_factory=dict)
+    per_trial: list[float] = field(default_factory=list)
+    evaluators: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The metrics as a JSON-ready dict."""
         return {
             "n_runs": self.n_runs, "n_tasks": self.n_tasks, "trials": self.trials,
             "n_successes": self.n_successes, "success_rate": self.success_rate,
@@ -36,10 +38,9 @@ class PerformanceMetrics:
 
 
 def compute_performance(trajectories: Sequence[Trajectory],
-                        per_run: Optional[Sequence[Any]] = None) -> PerformanceMetrics:
-    """Task performance over a set of runs.  ``per_run`` (the runs'
-    ``EfficiencyMetrics``, same order) supplies per-task cost; without it the
-    cost recorded on each trajectory is used."""
+                        per_run: Sequence[Any] | None = None) -> PerformanceMetrics:
+    """Task performance over a set of runs; ``per_run`` (their EfficiencyMetrics, same order)
+    supplies per-task cost, else each trajectory's recorded cost is used."""
     pm = PerformanceMetrics()
     pm.n_runs = len(trajectories)
     if not trajectories:
@@ -58,9 +59,9 @@ def compute_performance(trajectories: Sequence[Trajectory],
         costs = [(e.cost_usd, e.cost_complete) for e in per_run]
     else:
         costs = [(t.cost_usd, t.cost_is_complete) for t in trajectories]
-    by_task: Dict[str, List[Trajectory]] = defaultdict(list)
-    task_costs: Dict[str, List[Tuple[Optional[float], bool]]] = defaultdict(list)
-    by_trial: Dict[int, List[bool]] = defaultdict(list)
+    by_task: dict[str, list[Trajectory]] = defaultdict(list)
+    task_costs: dict[str, list[tuple[float | None, bool]]] = defaultdict(list)
+    by_trial: dict[int, list[bool]] = defaultdict(list)
     for t, c in zip(trajectories, costs):
         by_task[t.task_id].append(t)
         task_costs[t.task_id].append(c)

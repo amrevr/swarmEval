@@ -16,12 +16,12 @@ import argparse
 import importlib
 import os
 import sys
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable
 
 from . import __version__
+from .diagnostics.smells import load_smell_config
 from .evaluate import EvaluationResult, analyze_runs, evaluate, load_runset
 from .export import export_events
-from .diagnostics.smells import load_smell_config
 from .export.jsonl import write_events_jsonl
 from .graph.builder import build_graph
 from .graph.export import GRAPH_FORMATS, VIEWS, export_graph
@@ -35,6 +35,7 @@ from .similarity import resolve_similarity
 
 
 def _load_obj(spec: str) -> Any:
+    """Import ``package.module:attr`` from the current directory and return the attribute."""
     if ":" not in spec:
         raise SystemExit(f"expected package.module:attr (got {spec!r})")
     mod, attr = spec.split(":", 1)
@@ -43,13 +44,15 @@ def _load_obj(spec: str) -> Any:
 
 
 def _load_benchmark(spec: str) -> Benchmark:
+    """Load a benchmark from a file, or from ``package.module:attr`` (calling a builder)."""
     if ":" in spec and not os.path.exists(spec):
         obj = _load_obj(spec)
         return obj() if callable(obj) and not isinstance(obj, Benchmark) else obj
     return Benchmark.load(spec)
 
 
-def _clock_factory(name: Optional[str]) -> Optional[Callable[[], Any]]:
+def _clock_factory(name: str | None) -> Callable[[], Any] | None:
+    """Clock factory for ``--clock``: sim, wall (None) or an import path."""
     if name == "sim":
         return SimClock
     if name in (None, "wall"):
@@ -57,25 +60,26 @@ def _clock_factory(name: Optional[str]) -> Optional[Callable[[], Any]]:
     return _load_obj(name)
 
 
-def _analysis_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+def _analysis_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Coordination options shared by demo/run/report/compare."""
     smell_config = None
     if getattr(args, "smells_config", None):
         try:
             smell_config = load_smell_config(args.smells_config)
         except (OSError, ValueError) as exc:
-            raise SystemExit(f"swarmeval: --smells-config: {exc}")
+            raise SystemExit(f"swarmeval: --smells-config: {exc}") from None
     similarity = getattr(args, "similarity", None)
     if similarity:
         try:
             similarity = resolve_similarity(similarity)
         except (ImportError, ValueError, AttributeError, TypeError) as exc:
-            raise SystemExit(f"swarmeval: --similarity: {exc}")
+            raise SystemExit(f"swarmeval: --similarity: {exc}") from None
     return {"coordination": not getattr(args, "no_coordination", False), "similarity": similarity,
             "smell_config": smell_config}
 
 
 def _add_analysis_args(p: argparse.ArgumentParser) -> None:
+    """Add the coordination-analysis options to a subcommand."""
     p.add_argument("--no-coordination", action="store_true",
                    help="skip the coordination analysis (execution graph, smells)")
     p.add_argument("--similarity", default=None, metavar="NAME|pkg.mod:attr",
@@ -84,7 +88,8 @@ def _add_analysis_args(p: argparse.ArgumentParser) -> None:
                    help="JSON object overriding smell thresholds (see SmellConfig)")
 
 
-def _write_outputs(result: EvaluationResult, out: Optional[str]) -> None:
+def _write_outputs(result: EvaluationResult, out: str | None) -> None:
+    """Write the result JSON and its event stream into ``out``, if given."""
     if not out:
         return
     os.makedirs(out, exist_ok=True)
@@ -94,12 +99,14 @@ def _write_outputs(result: EvaluationResult, out: Optional[str]) -> None:
 
 
 def _add_html_args(p: argparse.ArgumentParser) -> None:
+    """Add the HTML report options to a subcommand."""
     p.add_argument("--html", default=None, metavar="FILE", help="also write a standalone HTML report")
     p.add_argument("--run", type=int, default=0, metavar="N",
                    help="which run the HTML agent graph and timeline show (default 0)")
 
 
 def _write_html(result: EvaluationResult, args: argparse.Namespace) -> None:
+    """Write the HTML report if ``--html`` was given, checking ``--run`` is in range."""
     if not args.html:
         return
     if not 0 <= args.run < len(result.runs):
@@ -109,6 +116,7 @@ def _write_html(result: EvaluationResult, args: argparse.Namespace) -> None:
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
+    """Run the simulated research swarm and print its report."""
     from .examples.research_swarm import build_benchmark, make_swarm
     result = evaluate(make_swarm, build_benchmark(), trials=args.trials, clock_factory=SimClock, progress=True,
                       **_analysis_kwargs(args))
@@ -122,6 +130,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    """Run a swarm on a benchmark, print the report and write the outputs."""
     swarm = _load_obj(args.swarm)
     bench = _load_benchmark(args.benchmark)
     pricing = PricingTable.load(args.pricing) if args.pricing else None
@@ -134,13 +143,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _load_runs_or_exit(path: str):
+    """Load a saved run set, exiting with the error message if the file has none."""
     try:
         return load_runset(path)
     except ValueError as exc:
-        raise SystemExit(f"swarmeval: {exc}")
+        raise SystemExit(f"swarmeval: {exc}") from None
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    """Re-analyse a saved run set and print its report."""
     runs = _load_runs_or_exit(args.path)
     pricing = PricingTable.load(args.pricing) if args.pricing else None
     result = analyze_runs(runs, pricing=pricing, **_analysis_kwargs(args))
@@ -155,13 +166,14 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
+    """Compare two saved run sets and print the comparison."""
     from .compare import compare
     base, cand = _load_runs_or_exit(args.baseline), _load_runs_or_exit(args.candidate)
     pricing = PricingTable.load(args.pricing) if args.pricing else None
     try:
         cmp = compare(base, cand, pricing=pricing, **_analysis_kwargs(args))
     except ValueError as exc:
-        raise SystemExit(f"swarmeval: {exc}")
+        raise SystemExit(f"swarmeval: {exc}") from None
     print(cmp.report())
     if args.out:
         cmp.save(args.out)
@@ -170,6 +182,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
+    """Convert a saved run set to a JSONL or Parquet event stream."""
     runs = _load_runs_or_exit(args.path)
     n = export_events(runs.trajectories, args.out, args.format or "")
     print(f"wrote {n} events to {args.out}")
@@ -177,6 +190,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_graph(args: argparse.Namespace) -> int:
+    """Export one run's execution graph as Mermaid, DOT or JSON."""
     runs = _load_runs_or_exit(args.path)
     if not 0 <= args.run < len(runs):
         raise SystemExit(f"swarmeval: --run {args.run} out of range (file has {len(runs)} runs)")
@@ -197,7 +211,8 @@ def cmd_graph(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run the chosen subcommand; returns the exit code."""
     p = argparse.ArgumentParser(prog="swarmeval", description="Record and evaluate multi-agent systems.")
     p.add_argument("--version", action="version", version=f"swarmeval {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -45,9 +45,9 @@ def test_sequential_calls_are_chained():
     ctx = make_ctx()
     clock = ctx.clock
     with ctx.agent("a") as a:
-        c1 = llm(a, clock, 1.0, label="1")
-        c2 = llm(a, clock, 1.0, label="2")
-        c3 = llm(a, clock, 1.0, label="3")
+        llm(a, clock, 1.0, label="1")
+        llm(a, clock, 1.0, label="2")
+        llm(a, clock, 1.0, label="3")
     g = build_graph(ctx.finish())
     ids = [e.event_id for e in g.units if e.kind == "llm"]
     assert len(ids) == 3
@@ -66,7 +66,7 @@ def test_gathered_calls_are_not_chained_and_the_next_call_depends_on_both():
 
     async def main():
         async with ctx.agent("a") as a:
-            await ctx.gather(a.allm(model, 1.0), a.allm(model, 2.0))   # [0,1] and [0,2]: one looks nested
+            await ctx.gather(a.allm(model, 1.0), a.allm(model, 2.0))
             await a.allm(model, 0.5)
 
     asyncio.run(main())
@@ -98,7 +98,7 @@ def test_tool_with_nested_llm_is_not_double_counted():
     assert inner.nested_in == tool_u.node_id and inner.start == 0.5
     assert all(inner.node_id not in (e.src, e.dst) for e in g.edges)
     assert inner not in g.dag_units
-    assert sum(u.weight for u in g.dag_units) == 3.0 + 1.0     # tool (3s, incl. inner) + following call
+    assert sum(u.weight for u in g.dag_units) == 3.0 + 1.0
     assert g.preds(after.node_id) == [tool_u.node_id]
 
 
@@ -126,7 +126,7 @@ def _send_receive(record_receive=True):
         a.send("b", "go")
     clock.advance(1.0)
     with ctx.agent("b") as b:
-        llm(b, clock, 0.5)          # unrelated work before reading the message
+        llm(b, clock, 0.5)
         if record_receive:
             b.receive()
         llm(b, clock, 1.0)
@@ -143,7 +143,7 @@ def test_recorded_receive_gives_a_real_message_edge():
     assert e.dst in g.preds(later.node_id)
     assert g.coverage.message_receive_coverage == 1.0
     (link,) = g.messages
-    assert link.received and link.used and link.used_inferred   # no artifacts: use judged from timing
+    assert link.received and link.used and link.used_inferred
 
 
 def test_without_receive_the_message_edge_is_inferred_to_the_first_unit_after_the_send():
@@ -165,7 +165,7 @@ def test_forwarding_an_artifact_is_not_consuming_it():
         a.send("hub", "notes", artifacts=[art])
     with ctx.agent("hub") as hub:
         (m,) = hub.receive()
-        llm(hub, clock, 0.5)                      # routing decision, does not read the notes
+        llm(hub, clock, 0.5)
         hub.send("b", m.content, artifacts=m.artifacts)
     with ctx.agent("b") as b:
         b.receive()
@@ -196,14 +196,13 @@ def test_invocation_edges_link_parent_frontier_child_and_resume():
     (wk,) = [u for u in g.units if u.agent_id == "worker"]
     inv = {(e.src, e.dst) for e in g.edges_of("invocation")}
     assert inv == {(b1.node_id, wk.node_id), (wk.node_id, b2.node_id)}
-    assert g.preds(b2.node_id) == [wk.node_id]          # not chained to b1 directly: the child sits between
+    assert g.preds(b2.node_id) == [wk.node_id]
     assert any(e.kind == "invocation" and (e.source, e.target) == ("boss", "worker") for e in g.agent_edges)
-    assert g.fan_out("boss") == 0 and g.fan_in("worker") == 0      # invocation is not communication fan
+    assert g.fan_out("boss") == 0 and g.fan_in("worker") == 0
 
 
 def test_wait_on_links_what_was_awaited():
     ctx = make_ctx()
-    clock = ctx.clock
     with ctx.agent("a") as a:
         art = a.produce("notes", "x")
         msg = a.send("b", "x")
@@ -224,5 +223,4 @@ def test_demo_graph_is_acyclic_fully_recorded_and_serialisable():
         assert not any(e.inferred for e in g.edges)
         assert all(g.coverage.consumers_instrumented.values())
         json.dumps(g.to_dict())
-        # the coordinator relays everything: it talks to every other agent
         assert g.fan_out("coordinator") == 5 and g.fan_in("coordinator") == 4
