@@ -12,9 +12,7 @@ def test_lexical_boundaries():
     lex = LexicalSimilarity()
     assert lex.similarity("The quick brown fox jumps", "the  QUICK brown fox jumps") == 1.0
     assert lex.similarity("alpha beta gamma delta", "one two three four") == 0.0
-    # 3-shingles: {a b c, b c d} vs {a b c, b c e} -> 1/3
     assert lex.similarity("a b c d", "a b c e") == pytest.approx(1 / 3)
-    # fewer than 3 words: word sets instead of shingles
     assert lex.similarity("hello world", "world hello") == 1.0
     assert lex.similarity("hello", "hello there friend") == pytest.approx(1 / 3)
     assert lex.similarity("", "") == 1.0
@@ -24,17 +22,17 @@ def test_lexical_candidates_use_index():
     lex = LexicalSimilarity()
     texts = [
         "Aurora was first released in 2015",
-        "Aurora was first released in 2016",           # shares shingles with 0
+        "Aurora was first released in 2016",
         "completely unrelated sentence about cooking pasta",
-        "hi",                                            # short, shares nothing
-        "hi there",                                      # short, shares 'hi' with 3
+        "hi",
+        "hi there",
     ]
     cands = lex.candidates(texts)
     assert (0, 1) in cands and (3, 4) in cands
-    assert all(2 not in p for p in cands)               # unrelated text never compared
+    assert all(2 not in p for p in cands)
     assert (0, 2) not in cands and (0, 3) not in cands
     hits = similar_pairs(lex, texts)
-    assert [(i, j) for i, j, _ in hits] == [(0, 1)]     # 3 of 5 shingles shared = 0.6; (3, 4) is 0.5
+    assert [(i, j) for i, j, _ in hits] == [(0, 1)]
 
 
 def fake_embed(texts):
@@ -57,9 +55,9 @@ def test_embedding_with_fake_embed_fn():
     assert scores[pairs.index((0, 1))] == pytest.approx(cosine([1, 0], [0.9, 0.1]))
     assert scores[pairs.index((0, 2))] == 0.0
     assert scores[pairs.index((0, 3))] == pytest.approx(1.0)
-    assert len(calls) == 1 and sorted(calls[0]) == ["car", "cat", "kitten"]   # each text embedded once
+    assert len(calls) == 1 and sorted(calls[0]) == ["car", "cat", "kitten"]
     hits = {(i, j) for i, j, _ in similar_pairs(emb, texts)}
-    assert hits == {(0, 1), (0, 3), (1, 3)}             # cos(cat, kitten) ~0.994 >= 0.85
+    assert hits == {(0, 1), (0, 3), (1, 3)}
 
 
 def test_embedding_pair_cap():
@@ -71,7 +69,7 @@ def test_embedding_pair_cap():
 
 
 def test_embedding_missing_extra(monkeypatch):
-    monkeypatch.setitem(sys.modules, "sentence_transformers", None)   # import now raises ImportError
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
     emb = EmbeddingSimilarity()
     with pytest.raises(ImportError, match=r"pip install 'swarmeval\[embeddings\]', or pass embed_fn="):
         emb.scores(["a", "b"], [(0, 1)])
@@ -80,7 +78,6 @@ def test_embedding_missing_extra(monkeypatch):
 def test_resolve_similarity(monkeypatch):
     assert isinstance(resolve_similarity(None), LexicalSimilarity)
     assert isinstance(resolve_similarity("lexical"), LexicalSimilarity)
-    # building the embeddings backend must not import the library
     real_import = builtins.__import__
 
     def guarded(name, *a, **kw):

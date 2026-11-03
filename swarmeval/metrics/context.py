@@ -20,12 +20,21 @@ on: ``"referenced"`` when the call had recorded inputs beyond the task,
 ``"task_only"`` when nothing was, ``"inferred"`` when message bodies were
 attributed by timing (Phase 1 data has no receive events: messages addressed
 to the agent and sent before the call are counted instead).
+
+Classes:
+- CallContext: Context accounting of one LLM call (definitions in the module docstring).
+- ContextMetrics: Context accounting of one run. ``ratio`` = Σ received ÷ Σ relevant over all LLM calls (``None``
+  without LLM calls); ``worst`` is the call with the highest ratio (ties: larger excess, then earliest). ``basis``
+  is ``"task_only"`` when no call had any recorded input beyond the task, ``"inferred"`` when any call relied on
+  timing-attributed messages, else ``"referenced"``.
+- ContextSummary: Context bloat over runs. ``worst_agents`` counts how often each agent made a run's worst call.
 """
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any
 
 from ..graph.builder import EPS
 from ..schema import Event, EventType, Trajectory, estimate_tokens
@@ -35,54 +44,50 @@ from .communication import body_tokens
 
 @dataclass
 class CallContext:
-    """Context accounting of one LLM call (definitions in the module docstring)."""
     event_id: str
-    agent_id: Optional[str]
-    span_id: Optional[str]
+    agent_id: str | None
+    span_id: str | None
     received: int
     relevant: int
     excess: int
     ratio: float
-    basis: str                      # referenced | task_only | inferred
-    parts: Dict[str, int] = field(default_factory=dict)
+    basis: str
+    parts: dict[str, int] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The record as a JSON-ready dict."""
         return asdict(self)
 
 
 @dataclass
 class ContextMetrics:
-    """Context accounting of one run.  ``ratio`` = Σ received ÷ Σ relevant
-    over all LLM calls (``None`` without LLM calls); ``worst`` is the call
-    with the highest ratio (ties: larger excess, then earliest).
-    ``basis`` is ``"task_only"`` when no call had any recorded input beyond
-    the task, ``"inferred"`` when any call relied on timing-attributed
-    messages, else ``"referenced"``."""
     llm_calls: int = 0
     received: int = 0
     relevant: int = 0
     excess: int = 0
-    ratio: Optional[float] = None
-    basis: Optional[str] = None
-    worst: Optional[CallContext] = None
-    calls: List[CallContext] = field(default_factory=list)
+    ratio: float | None = None
+    basis: str | None = None
+    worst: CallContext | None = None
+    calls: list[CallContext] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The metrics as a JSON-ready dict."""
         d = asdict(self)
         d["worst"] = self.worst.to_dict() if self.worst else None
         return d
 
 
 def compute_context(traj: Trajectory) -> ContextMetrics:
+    """Received versus relevant tokens for every LLM call of one run."""
     seq = {ev.event_id: i for i, ev in enumerate(traj.events)}
     events = sorted(traj.events, key=lambda e: (round(e.timestamp, 9), seq[e.event_id]))
-    by_span: Dict[str, List[Event]] = defaultdict(list)
+    by_span: dict[str, list[Event]] = defaultdict(list)
     for ev in events:
         if ev.span_id:
             by_span[ev.span_id].append(ev)
     sent = {ev.message_id: ev for ev in traj.messages() if ev.message_id}
     has_receives = bool(traj.events_of(EventType.MESSAGE_RECEIVE))
-    to_agent: Dict[str, List[Event]] = defaultdict(list)
+    to_agent: dict[str, list[Event]] = defaultdict(list)
     if not has_receives:
         for ev in traj.messages():
             if ev.receiver:
@@ -95,7 +100,7 @@ def compute_context(traj: Trajectory) -> ContextMetrics:
         if call.event_type != EventType.LLM_CALL.value:
             continue
         t0 = call.timestamp
-        art_ids: Set[str] = set(call.input_artifacts)
+        art_ids: set[str] = set(call.input_artifacts)
         msg_body, prior_out, inferred = 0, 0, False
         for ev in by_span.get(call.span_id or "", []):
             if ev.event_id == call.event_id or ev.timestamp > t0 + EPS:
@@ -108,7 +113,6 @@ def compute_context(traj: Trajectory) -> ContextMetrics:
                 if m is not None:
                     msg_body += body_tokens(m, traj)
             elif et in (EventType.LLM_CALL.value, EventType.TOOL_CALL.value) and ev.end_timestamp <= t0 + EPS:
-                # earlier output of this span (a call still running when this one started is not)
                 prior_out += ev.output_tokens if et == EventType.LLM_CALL.value else ev.content_tokens
         if not has_receives and call.agent_id:
             msgs = [m for m in to_agent.get(call.agent_id, []) if m.timestamp <= t0 + EPS]
@@ -141,26 +145,26 @@ def compute_context(traj: Trajectory) -> ContextMetrics:
 
 @dataclass
 class ContextSummary:
-    """Context bloat over runs.  ``worst_agents`` counts how often each agent
-    made a run's worst call."""
     n_runs: int
-    ratio: Optional[Summary]
+    ratio: Summary | None
     excess: Summary
-    worst_ratio: Optional[Summary]
-    worst_agents: Dict[str, int] = field(default_factory=dict)
-    bases: Dict[str, int] = field(default_factory=dict)
+    worst_ratio: Summary | None
+    worst_agents: dict[str, int] = field(default_factory=dict)
+    bases: dict[str, int] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The summary as a JSON-ready dict."""
         return {k: (v.to_dict() if isinstance(v, Summary) else v) for k, v in self.__dict__.items()}
 
 
 def summarize_context(per_run: Sequence[ContextMetrics]) -> ContextSummary:
+    """Context bloat over runs."""
     ratios = [r.ratio for r in per_run if r.ratio is not None]
     worst = [r.worst for r in per_run if r.worst is not None]
-    agents: Dict[str, int] = defaultdict(int)
+    agents: dict[str, int] = defaultdict(int)
     for w in worst:
         agents[w.agent_id or "-"] += 1
-    bases: Dict[str, int] = defaultdict(int)
+    bases: dict[str, int] = defaultdict(int)
     for r in per_run:
         if r.basis:
             bases[r.basis] += 1

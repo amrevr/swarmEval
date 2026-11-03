@@ -32,7 +32,7 @@ def test_send_and_receive_share_message_id_and_receive_is_attributed_to_receiver
     (recv_ev,) = traj.events_of(EventType.MESSAGE_RECEIVE)
     assert sent.message_id == got.message_id == msg_ev.message_id == recv_ev.message_id
     assert recv_ev.agent_id == "b" and recv_ev.span_id == b.span_id and recv_ev.sender == "a"
-    assert recv_ev.input_artifacts == [art.artifact_id]       # transported, not consumed
+    assert recv_ev.input_artifacts == [art.artifact_id]
     assert recv_ev.content_tokens == 0 and recv_ev.kind == "result"
     assert recv_ev.metadata["delay_s"] == pytest.approx(2.0)
     assert traj.metadata["schema_version"] == SCHEMA_VERSION == 2
@@ -66,7 +66,7 @@ def test_inbox_records_nothing_and_receive_outside_own_span_has_no_span():
         a.send("b", "hi")
         n = len(ctx.trajectory.events)
         assert len(ctx.inbox("b")) == 1 and len(ctx.trajectory.events) == n
-        ctx.receive("b")   # read on b's behalf while a's span is active
+        ctx.receive("b")
     (ev,) = ctx.finish().events_of(EventType.MESSAGE_RECEIVE)
     assert ev.agent_id == "b" and ev.span_id is None
 
@@ -104,7 +104,7 @@ def test_wait_on_messages_artifacts_and_agents():
     assert w1.metadata == {"on_messages": [msg.message_id]} and w1.input_artifacts == []
     assert w2.metadata == {"on_agents": ["a"]} and w2.input_artifacts == [art.artifact_id]
     assert w2.latency_ms == pytest.approx(500.0)
-    assert w3.metadata == {} and w3.input_artifacts == []   # unchanged Phase 1 shape
+    assert w3.metadata == {} and w3.input_artifacts == []
 
 
 def test_nested_call_records_its_parent_but_gathered_calls_do_not():
@@ -158,9 +158,6 @@ def test_unknown_and_missing_fields_are_tolerated():
     assert a.derived_from is None
 
 
-# --------------------------------------------------------------------------- #
-# Phase 1 data
-# --------------------------------------------------------------------------- #
 def test_phase1_fixture_loads_and_analyses_with_inferred_edges():
     runs = RunSet.load(FIXTURE)
     assert len(runs) == 2
@@ -174,7 +171,6 @@ def test_phase1_fixture_loads_and_analyses_with_inferred_edges():
         assert all(not m.received and m.inferred for m in g.messages)
         assert cm.coverage.message_receive_coverage == 0.0
         assert cm.coverage.derivation_coverage == 0.0
-        # lineage is still found, through span consumption, and flagged as such
         assert set(cm.lineage_agents) == {"researcher_a", "researcher_b", "critic", "synthesizer"}
         assert cm.contribution["researcher_a"].lineage_inferred
         assert not cm.contribution["synthesizer"].lineage_inferred

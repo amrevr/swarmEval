@@ -18,7 +18,7 @@ Streaming (``stream=True``) is not instrumented yet: such calls pass through unr
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from ..recorder import LLMCall, LLMResult, _current_llm_call, _current_span
 
@@ -27,6 +27,7 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
 def _text_of(response: Any) -> str:
+    """Text of a response's text blocks, empty for a refusal."""
     if getattr(response, "stop_reason", None) == "refusal":
         return ""
     parts = []
@@ -48,23 +49,22 @@ def _usage(response: Any) -> tuple:
 
 
 def _client(client: Any) -> Any:
+    """The given client, or a default Anthropic client."""
     if client is not None:
         return client
-    import anthropic  # local import: optional dependency
+    import anthropic
     return anthropic.Anthropic()
 
 
 def _is_async(fn: Any) -> bool:
+    """True if ``fn`` is a coroutine function."""
     return inspect.iscoroutinefunction(fn)
 
 
 def anthropic_llm(client: Any = None, model: str = DEFAULT_MODEL, max_tokens: int = 16000,
-                  system: Optional[str] = None, fallbacks: bool = True, **extra: Any) -> Callable[..., Any]:
-    """Build a prompt -> LLMResult callable backed by the Messages API.
-
-    With ``fallbacks=True`` (default) requests use the beta server-side
-    fallback so a safety refusal is retried on a fallback model.  For an
-    async client the callable is ``async`` (use it with ``span.allm``)."""
+                  system: str | None = None, fallbacks: bool = True, **extra: Any) -> Callable[..., Any]:
+    """Build a prompt -> LLMResult callable on the Messages API (async for an async client, for ``span.allm``).
+    With ``fallbacks=True`` a safety refusal is retried on a fallback model server-side."""
     c = _client(client)
 
     def request(prompt: str) -> tuple:
@@ -109,6 +109,7 @@ def _fill(call: LLMCall, resp: Any) -> None:
 
 
 def _wrap(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a create method to record calls inside agent spans; streamed calls pass through."""
     if _is_async(original):
         async def acreate(*args: Any, **kwargs: Any) -> Any:
             if kwargs.get("stream"):

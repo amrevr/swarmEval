@@ -4,14 +4,23 @@ import re
 from functools import partial
 
 import pytest
+from test_metrics import fan_out_trajectory
 
-from swarmeval import (Diagnostic, RunContext, SimClock, SmellConfig, Task, analyze_runs, compute_coordination,
-                       evaluate, load_smell_config, summarize_diagnostics)
+from swarmeval import (
+    Diagnostic,
+    RunContext,
+    SimClock,
+    SmellConfig,
+    Task,
+    analyze_runs,
+    compute_coordination,
+    evaluate,
+    load_smell_config,
+    summarize_diagnostics,
+)
 from swarmeval.diagnostics.smells import SMELLS, detect_smells, resolve_smell_config
 from swarmeval.examples.research_swarm import ResearchSwarm, build_benchmark, make_swarm
 from swarmeval.report.text import render_coordination
-
-from test_metrics import fan_out_trajectory
 
 BANNED = [re.compile(p, re.IGNORECASE)
           for p in (r"\bcaus", r"contributed \d+%", r"responsible for", r"because of")]
@@ -42,9 +51,6 @@ def demo():
     return evaluate(make_swarm, build_benchmark(), trials=2, clock_factory=SimClock)
 
 
-# --------------------------------------------------------------------------- #
-# golden demo
-# --------------------------------------------------------------------------- #
 def test_golden_demo_smells(demo):
     expected = {"coordinator_bottleneck", "dead_agent", "under_specialization", "redundant_delegation",
                 "context_bloat"}
@@ -54,8 +60,6 @@ def test_golden_demo_smells(demo):
         assert of(cm, "under_specialization")[0].agents == ["researcher_a", "researcher_c"]
         assert of(cm, "redundant_delegation")[0].agents == ["coordinator", "researcher_a", "researcher_c"]
         assert of(cm, "coordinator_bottleneck")[0].agents == ["coordinator"]
-        # the synthesizer (extra 9000 tokens) and the coordinator's hand-off call (extra 2600) are both
-        # well above the threshold: a correct observation, not noise
         assert {tuple(d.agents) for d in of(cm, "context_bloat")} == {("coordinator",), ("synthesizer",)}
         assert not any(d.inferred for d in cm.diagnostics)
     rep = demo.coordination.diagnostics
@@ -69,7 +73,7 @@ def test_bottleneck_relay_and_critical_path_evidence(demo):
     d = of(demo.per_run_coordination[0], "coordinator_bottleneck")[0]
     ev = d.evidence
     assert ev["hub_share"] == 1.0 and len(ev["peers"]) == 5
-    assert ev["relay_fraction"] == pytest.approx(0.4)          # below 0.5: fires on the critical-path share
+    assert ev["relay_fraction"] == pytest.approx(0.4)
     assert ev["critical_path_share"] >= 0.25 and d.severity == "medium"
 
 
@@ -87,13 +91,10 @@ def test_review_rounds_show_ping_pong_without_a_cycle():
         pp = of(cm, "agent_ping_pong")
         assert len(pp) == 1 and pp[0].agents == ["coordinator", "critic"]
         assert pp[0].evidence["alternations"] == 5 and pp[0].severity == "medium"
-        assert cm.dependency.cycles == []           # request/response round trips are not cycles
+        assert cm.dependency.cycles == []
         assert "premature_synthesis" not in names(cm) and "late_information" not in names(cm)
 
 
-# --------------------------------------------------------------------------- #
-# individual smells
-# --------------------------------------------------------------------------- #
 def exchange_traj(n_messages):
     """a and b take turns: n messages, n - 1 changes of direction."""
     ctx = make_ctx()
@@ -113,10 +114,10 @@ def exchange(n_messages, **kw):
 
 
 def test_ping_pong_thresholds():
-    assert not of(exchange(4), "agent_ping_pong")                     # 3 alternations
-    six = of(exchange(7), "agent_ping_pong")                          # 6 alternations
+    assert not of(exchange(4), "agent_ping_pong")
+    six = of(exchange(7), "agent_ping_pong")
     assert len(six) == 1 and six[0].severity == "medium" and six[0].evidence["alternations"] == 6
-    assert of(exchange(9), "agent_ping_pong")[0].severity == "high"  # 8 alternations
+    assert of(exchange(9), "agent_ping_pong")[0].severity == "high"
     assert not of(exchange(7, smell_config={"pingpong_min_alternations": 7}), "agent_ping_pong")
 
 
@@ -158,7 +159,7 @@ def test_over_agentization_on_a_simple_task():
     d = of(cm, "over_agentization")
     assert len(d) == 1 and d[0].severity == "low" and d[0].evidence["agents"] == 3
     many = compute_coordination(fan_out_trajectory())
-    assert "over_agentization" not in names(many)     # nobody unused, task difficulty unknown
+    assert "over_agentization" not in names(many)
 
 
 def test_late_information_and_premature_synthesis():
@@ -182,7 +183,7 @@ def test_late_information_and_premature_synthesis():
         llm(r)
         r.send("writer", "an important late finding", kind="result")
     with ctx.agent("writer") as w:
-        w.receive()                       # read, but nothing produced afterwards
+        w.receive()
     ctx.set_output("the draft", artifacts=[final])
     cm = compute_coordination(ctx.finish())
     pre = of(cm, "premature_synthesis")
@@ -214,15 +215,12 @@ def test_dead_agent_needs_complete_provenance():
         art = a.produce("notes", "n")
         a.send("b", "notes", kind="result", artifacts=[art])
     with ctx.agent("b") as b:
-        b.receive()                      # b records nothing about use: coverage incomplete
+        b.receive()
         llm(b)
     cm = compute_coordination(ctx.finish())
     assert cm.contribution["a"].dead is None and not of(cm, "dead_agent")
 
 
-# --------------------------------------------------------------------------- #
-# configuration
-# --------------------------------------------------------------------------- #
 def test_smell_config_overrides_and_unknown_keys(tmp_path, demo):
     p = tmp_path / "smells.json"
     p.write_text(json.dumps({"bloat_ratio": 100.0, "hub_share": 0.99}))
@@ -249,9 +247,6 @@ def test_detect_smells_runs_on_precomputed_metrics(demo):
     assert all(d.smell in SMELLS for d in again)
 
 
-# --------------------------------------------------------------------------- #
-# engine
-# --------------------------------------------------------------------------- #
 def D(smell, sev, run, agents=(), inferred=False, obs=None):
     return Diagnostic(smell, sev, run, list(agents), obs or f"{smell} {sev} in {run}", "may", "test", {}, inferred)
 
@@ -267,14 +262,14 @@ def test_engine_counts_each_run_once_and_orders_by_severity_then_prevalence():
     }
     rep = summarize_diagnostics(per_run)
     assert rep.n_runs == 4 and rep.total == 7
-    assert rep.names == ["dead_agent", "agent_ping_pong", "context_bloat"]   # high (50%), high (25%), low
+    assert rep.names == ["dead_agent", "agent_ping_pong", "context_bloat"]
     dead = rep.get("dead_agent")
     assert dead.runs_affected == 2 and dead.prevalence == 0.5
     assert dead.severity_counts == {"medium": 1, "high": 1} and dead.max_severity == "high"
-    assert dead.agents == {"x": 2, "y": 1}                     # x once per run, not three times
+    assert dead.agents == {"x": 2, "y": 1}
     assert dead.observation == "dead_agent high in r2" and dead.example_runs == ["r2", "r1"]
     bloat = rep.get("context_bloat")
-    assert bloat.inferred_runs == 1 and bloat.observation == "context_bloat low in r1"   # tie: earliest run
+    assert bloat.inferred_runs == 1 and bloat.observation == "context_bloat low in r1"
     as_list = summarize_diagnostics([per_run[k] for k in ("r1", "r2", "r3", "r4")])
     assert [s.runs_affected for s in as_list.smells] == [2, 1, 2]
     assert summarize_diagnostics({}).smells == [] and summarize_diagnostics([[]], n_runs=5).n_runs == 5
@@ -286,9 +281,6 @@ def test_engine_keeps_at_most_three_examples():
     assert rep.get("dead_agent").example_runs == ["r0", "r1", "r2"]
 
 
-# --------------------------------------------------------------------------- #
-# language
-# --------------------------------------------------------------------------- #
 def test_no_causal_or_credit_language_anywhere(demo):
     texts = []
     rounds = evaluate(partial(make_swarm, review_rounds=3), build_benchmark(2), trials=1, clock_factory=SimClock)

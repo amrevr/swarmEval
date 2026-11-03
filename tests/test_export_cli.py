@@ -1,9 +1,19 @@
+"""Tests for evaluate(), saving and loading run sets, JSONL export and the CLI commands."""
 import json
 
-from swarmeval.examples.research_swarm import build_benchmark, make_swarm
-from swarmeval import (Benchmark, EvaluationResult, FunctionSwarm, SimClock, Task, evaluate, read_events_jsonl,
-                       render_trajectory, write_events_jsonl)
+from swarmeval import (
+    Benchmark,
+    EvaluationResult,
+    FunctionSwarm,
+    SimClock,
+    Task,
+    evaluate,
+    read_events_jsonl,
+    render_trajectory,
+    write_events_jsonl,
+)
 from swarmeval.cli import main
+from swarmeval.examples.research_swarm import build_benchmark, make_swarm
 from swarmeval.runner import RunSet, derive_seed
 
 

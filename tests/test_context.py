@@ -7,7 +7,7 @@ from swarmeval.examples.research_swarm import build_benchmark, make_swarm
 from swarmeval.metrics.context import compute_context
 from swarmeval.schema import estimate_tokens
 
-TASK = "q" * 40          # 10 tokens
+TASK = "q" * 40
 
 
 def make_ctx():
@@ -33,7 +33,6 @@ def test_demo_synthesizer_is_flagged_high():
         worst = cm.context.worst
         assert worst.agent_id == "synthesizer" and worst.basis == "referenced"
         assert worst.received > 9000 and worst.ratio > 10
-        # task + notes_a + notes_b + critique + the message body (artifacts counted once, as artifacts)
         assert set(worst.parts) == {"task", "artifacts", "messages", "prior_outputs", "system"}
         assert worst.parts["messages"] < 50 and worst.parts["artifacts"] > 0
         d = next(d for d in bloat(cm) if d.agents == ["synthesizer"])
@@ -45,7 +44,7 @@ def test_demo_synthesizer_is_flagged_high():
 def test_call_receiving_exactly_what_it_references_is_not_flagged():
     ctx = make_ctx()
     with ctx.agent("a") as a:
-        art = a.produce("doc", "x" * 40_000)           # 10,000 tokens
+        art = a.produce("doc", "x" * 40_000)
         call(a, 10 + 10_000, input_artifacts=[art])
     cm = compute_coordination(ctx.finish())
     c = cm.context.calls[0]
@@ -56,12 +55,12 @@ def test_call_receiving_exactly_what_it_references_is_not_flagged():
 def test_received_messages_and_earlier_outputs_count_as_relevant():
     ctx = make_ctx()
     with ctx.agent("boss") as b:
-        art = b.produce("brief", "y" * 400)           # 100 tokens
-        b.send("w", "z" * 80, kind="request", artifacts=[art])   # body 20 tokens + artifact 100
+        art = b.produce("brief", "y" * 400)
+        b.send("w", "z" * 80, kind="request", artifacts=[art])
     with ctx.agent("w") as w:
         w.receive()
         w.consume(art)
-        w.call_tool("lookup", lambda: "r" * 200)      # result: 50 tokens
+        w.call_tool("lookup", lambda: "r" * 200)
         call(w, 100, out=30)
         c2 = call(w, 1000)
     ctx_m = compute_context(ctx.finish())
@@ -82,7 +81,6 @@ def test_system_tokens_are_counted_relevant():
     with_sys, without = cm.context.calls
     assert with_sys.relevant == 5010 and with_sys.excess == 0 and with_sys.basis == "referenced"
     assert without.parts["prior_outputs"] == 10 and without.excess == 5010 - 20
-    # only the call without a recorded system prompt is flagged
     d = bloat(cm)
     assert len(d) == 1 and d[0].evidence["worst_event_id"] == without.event_id
 
@@ -90,7 +88,7 @@ def test_system_tokens_are_counted_relevant():
 def test_task_only_basis_caps_severity():
     ctx = make_ctx()
     with ctx.agent("a") as a:
-        call(a, 50_000)                              # nothing recorded beyond the task
+        call(a, 50_000)
     cm = compute_coordination(ctx.finish())
     assert cm.context.basis == "task_only" and cm.context.calls[0].relevant == estimate_tokens(TASK)
     d = bloat(cm)

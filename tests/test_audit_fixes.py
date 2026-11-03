@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from swarmeval import Benchmark, EvaluationResult, RunContext, SimClock, Task, evaluate, evaluators as E
+from swarmeval import Benchmark, EvaluationResult, RunContext, SimClock, Task, evaluate
+from swarmeval import evaluators as E
 from swarmeval.cli import main
 from swarmeval.integrations.anthropic import instrument_client
 from swarmeval.report.text import box
@@ -26,12 +27,11 @@ def no_escape(fn, *args, **kwargs):
         pytest.fail("KeyboardInterrupt escaped: finished runs were lost")
 
 
-# -- audit 1: an interrupt keeps the finished runs ---------------------------- #
 def test_interrupt_returns_runs_finished_before_it():
     def swarm(task, ctx):
         with ctx.agent("solo"):
             if task.task_id == "t3":
-                raise KeyboardInterrupt  # through an open span, as in a real Ctrl-C
+                raise KeyboardInterrupt
         return "42"
 
     res = no_escape(evaluate, swarm, five_tasks(), clock_factory=SimClock)
@@ -51,9 +51,8 @@ def test_cli_run_saves_partial_results_on_interrupt(tmp_path, monkeypatch):
     assert len(saved.runs.trajectories) == 2 and saved.runs.metadata["interrupted"] is True
 
 
-# -- audit 2: a streamed call is not recorded as a $0 call -------------------- #
 def streaming_client(is_async=False):
-    stream = object()  # an SDK stream has no .usage or .content
+    stream = object()
 
     def create(**kw):
         return stream
@@ -83,13 +82,12 @@ def test_streamed_call_is_passed_through_unrecorded(is_async):
     assert ctx.finish().llm_calls() == []
 
 
-# -- audit 3: a crashing evaluator is visible --------------------------------- #
 def broken(task, output, traj):
     raise NameError("typo")
 
 
 def report_line(report, label):
-    (line,) = [l for l in report.splitlines() if label in l]
+    (line,) = [ln for ln in report.splitlines() if label in ln]
     return line
 
 
@@ -106,7 +104,6 @@ def test_evaluator_errors_survive_save_and_load(tmp_path):
     assert EvaluationResult.load(str(tmp_path / "r.json")).performance.evaluator_errors == 5
 
 
-# -- audit 4: composite weights must match its evaluators --------------------- #
 def test_weight_count_mismatch_fails_before_any_run():
     spec = {"type": "composite", "weights": [1],
             "evaluators": [{"type": "exact_match", "expected": "a"}, {"type": "exact_match", "expected": "b"}]}
@@ -114,7 +111,6 @@ def test_weight_count_mismatch_fails_before_any_run():
         Benchmark("b", [Task("q", "what?", evaluator=spec)]).validate()
 
 
-# -- audit 5: the report box widens instead of cutting values ----------------- #
 def test_box_keeps_long_values_and_flags():
     value = "1,234,567  (in 1,000,000 / out 234,567)"
     out = box("SWARM EVALUATION", [("Tokens / Run", value, "⚠"), "short"])

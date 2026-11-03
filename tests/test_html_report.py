@@ -52,7 +52,6 @@ def test_demo_renders_graph_timeline_and_sections(demo_html):
     for smell in ("dead_agent", "coordinator_bottleneck", "context_bloat"):
         assert smell in doc
     assert "Observed:" in doc and "Hypothesis:" in doc and "Test:" in doc
-    # coordination tiles reuse the text-report labels, with their definitions as captions
     assert "Actual Parallelism" in doc and "work ÷ wall" in doc
     assert "Communication / Work" in doc and "message ÷ LLM tokens" in doc
     assert "no overall score" in doc
