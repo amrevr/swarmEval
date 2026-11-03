@@ -46,7 +46,7 @@ from typing import Any
 from ..graph.builder import ExecutionGraph
 from ..schema import Event, EventType, Status, Trajectory, to_text
 from ..similarity import resolve_similarity, similar_pairs
-from ..stats import Summary, summarize
+from ..stats import Summary, known_summary, summarize
 
 VERIFICATION_ROLES = frozenset({"critic", "verifier", "reviewer", "validator", "judge"})
 DUPLICATE_CLASSES = ("accidental", "verification", "retry")
@@ -267,11 +267,6 @@ def compute_redundancy(traj: Trajectory, graph: ExecutionGraph | None = None,
     return out
 
 
-def _known(values: Sequence[float | None]) -> Summary | None:
-    """Summary of the defined values, None when there are none."""
-    known = [v for v in values if v is not None]
-    return summarize(known) if known else None
-
 
 @dataclass
 class RedundancySummary:
@@ -297,8 +292,8 @@ def summarize_redundancy(per_run: Sequence[RedundancyMetrics]) -> RedundancySumm
     S = summarize
     return RedundancySummary(
         n_runs=len(per_run),
-        tool_redundancy=_known([r.tool_redundancy for r in per_run]),
-        artifact_redundancy=_known([r.artifact_redundancy for r in per_run]),
+        tool_redundancy=known_summary([r.tool_redundancy for r in per_run]),
+        artifact_redundancy=known_summary([r.artifact_redundancy for r in per_run]),
         accidental_duplicates=S([r.accidental_duplicates for r in per_run]),
         verification_duplicates=S([r.verification_duplicates for r in per_run]),
         retry_duplicates=S([r.retry_duplicates for r in per_run]),

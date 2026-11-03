@@ -42,3 +42,19 @@ def test_checker_allows_directives_dunders_and_test_functions():
 def test_ruff_passes():
     result = subprocess.run(["ruff", "check", str(ROOT)], capture_output=True, text=True, cwd=ROOT)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_checker_fails_on_missing_path(tmp_path, capsys):
+    assert check_comments.main([str(tmp_path / "nope")]) == 1
+    assert "no such file or directory" in capsys.readouterr().out
+
+
+def test_checker_defaults_to_repo_root(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert check_comments.main([]) == 0, capsys.readouterr().out
+
+
+def test_test_file_is_judged_relative_to_repo_root():
+    assert check_comments.is_test_file(ROOT / "tests" / "test_x.py")
+    assert not check_comments.is_test_file(ROOT / "swarmeval" / "tests_helper.py")
+    assert not check_comments.is_test_file(ROOT / "swarmeval" / "tests" / "x.py")

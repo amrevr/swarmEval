@@ -45,7 +45,7 @@ from typing import Any
 
 from ..graph.builder import EPS, ExecutionGraph, build_graph
 from ..schema import MessageKind, Trajectory
-from ..stats import Summary, summarize
+from ..stats import Summary, known_summary, summarize
 from .efficiency import EfficiencyMetrics, union_length
 
 _CALL_KINDS = ("llm", "tool")
@@ -265,11 +265,6 @@ class DependencySummary:
         return {k: (v.to_dict() if isinstance(v, Summary) else v) for k, v in self.__dict__.items()}
 
 
-def _known(values: Sequence[float | None]) -> Summary | None:
-    """Summary of the defined values, None when there are none."""
-    known = [v for v in values if v is not None]
-    return summarize(known) if known else None
-
 
 def summarize_dependency(per_run: Sequence[DependencyMetrics]) -> DependencySummary:
     """``critical_path_share[a]`` = mean over runs of agent ``a``'s working
@@ -286,11 +281,11 @@ def summarize_dependency(per_run: Sequence[DependencyMetrics]) -> DependencySumm
     return DependencySummary(
         n_runs=len(per_run), critical_path_s=summarize([r.critical_path_s for r in per_run]),
         work_s=summarize([r.work_s for r in per_run]),
-        actual_parallelism=_known([r.actual_parallelism for r in per_run]),
-        potential_parallelism=_known([r.potential_parallelism for r in per_run]),
-        headroom_s=_known([r.headroom_s for r in per_run]),
-        headroom_ratio=_known([r.headroom_ratio for r in per_run]),
-        unrecorded_s=_known([r.unrecorded_s for r in per_run]),
+        actual_parallelism=known_summary([r.actual_parallelism for r in per_run]),
+        potential_parallelism=known_summary([r.potential_parallelism for r in per_run]),
+        headroom_s=known_summary([r.headroom_s for r in per_run]),
+        headroom_ratio=known_summary([r.headroom_ratio for r in per_run]),
+        unrecorded_s=known_summary([r.unrecorded_s for r in per_run]),
         depth=summarize([r.depth for r in per_run]),
         runs_with_cycles=sum(1 for r in per_run if r.cycles), isolated_agents=dict(iso),
         critical_path_share={a: sum(v) / n_cp for a, v in share.items()} if n_cp else {})

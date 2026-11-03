@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from ..graph.builder import Coverage, ExecutionGraph, build_graph
 from ..schema import Trajectory
 from ..similarity import resolve_similarity
-from ..stats import Summary, mean, summarize
+from ..stats import Summary, known_summary, mean, summarize
 from .communication import CommunicationMetrics, CommunicationSummary, compute_communication, summarize_communication
 from .context import ContextMetrics, ContextSummary, compute_context, summarize_context
 from .contribution import (
@@ -134,11 +134,6 @@ class CoordinationSummary:
         }
 
 
-def _known(values: Sequence[float | None]) -> Summary | None:
-    """Summary of the defined values, None when there are none."""
-    known = [v for v in values if v is not None]
-    return summarize(known) if known else None
-
 
 def summarize_coordination(per_run: Sequence[CoordinationMetrics]) -> CoordinationSummary:
     """Coordination metrics over runs, summarizing each analysis the runs have."""
@@ -159,8 +154,8 @@ def summarize_coordination(per_run: Sequence[CoordinationMetrics]) -> Coordinati
     ctx = [cm.context for cm in per_run if cm.context is not None]
     return CoordinationSummary(
         n_runs=len(per_run),
-        message_receive_coverage=_known([cm.coverage.message_receive_coverage for cm in per_run]),
-        derivation_coverage=_known([cm.coverage.derivation_coverage for cm in per_run]),
+        message_receive_coverage=known_summary([cm.coverage.message_receive_coverage for cm in per_run]),
+        derivation_coverage=known_summary([cm.coverage.derivation_coverage for cm in per_run]),
         dead_agents_per_run=summarize([len(cm.dead_agents) for cm in per_run]),
         utilization=utilization,
         contribution=summarize_contribution([cm.contribution for cm in per_run]),

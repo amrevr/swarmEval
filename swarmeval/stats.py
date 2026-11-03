@@ -59,3 +59,9 @@ def summarize(values: Sequence[float]) -> Summary:
     if not values:
         return Summary(0, 0.0, 0.0, 0.0, 0.0, 0.0)
     return Summary(len(values), mean(values), stdev(values), min(values), max(values), sum(values))
+
+
+def known_summary(values: Sequence[float | None]) -> Summary | None:
+    """Summary of the defined values, None when there are none."""
+    known = [v for v in values if v is not None]
+    return summarize(known) if known else None

@@ -42,7 +42,7 @@ from typing import Any
 
 from ..graph.builder import ExecutionGraph, build_graph
 from ..schema import EventType, MessageKind, Trajectory
-from ..stats import Summary, mean, summarize
+from ..stats import Summary, known_summary, mean, summarize
 
 CATEGORIES: dict[str, str] = {
     MessageKind.TASK_ASSIGNMENT.value: "coordination",
@@ -183,11 +183,6 @@ def compute_communication(traj: Trajectory, graph: ExecutionGraph | None = None)
     return out
 
 
-def _known(values: Sequence[float | None]) -> Summary | None:
-    """Summary of the defined values, None when there are none."""
-    known = [v for v in values if v is not None]
-    return summarize(known) if known else None
-
 
 @dataclass
 class CommunicationSummary:
@@ -226,11 +221,11 @@ def summarize_communication(per_run: Sequence[CommunicationMetrics]) -> Communic
     return CommunicationSummary(
         n_runs=len(per_run), messages=S([r.messages for r in per_run]),
         body_tokens=S([r.body_tokens for r in per_run]),
-        comm_work_ratio=_known([r.comm_work_ratio for r in per_run]),
-        hub_share=_known([r.hub_share for r in per_run]),
-        used_edge_ratio=_known([r.used_edge_ratio for r in per_run]),
+        comm_work_ratio=known_summary([r.comm_work_ratio for r in per_run]),
+        hub_share=known_summary([r.hub_share for r in per_run]),
+        used_edge_ratio=known_summary([r.used_edge_ratio for r in per_run]),
         repeated_messages=S([r.repeated_messages for r in per_run]),
         broadcasts=S([r.broadcasts for r in per_run]),
-        receive_delay_mean_s=_known([r.receive_delay_mean_s for r in per_run]),
+        receive_delay_mean_s=known_summary([r.receive_delay_mean_s for r in per_run]),
         by_category=by_cat, hub_agents=dict(Counter(r.hub_agent for r in per_run if r.hub_agent)),
         per_agent=per_agent)

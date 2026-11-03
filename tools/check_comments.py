@@ -1,6 +1,7 @@
 """Enforce the comment rules: a module docstring, 1-2 line function summaries, and nothing else.
 
-Usage: python tools/check_comments.py [PATH ...]  (defaults to swarmeval, tests, examples, tools).
+Usage: python tools/check_comments.py [PATH ...]  (defaults to swarmeval, tests, examples, tools under the repo root;
+a path that does not exist is an error).
 Rules: every file opens with an overview docstring; every module- or class-level function outside tests
 has a docstring of at most two lines (dunder methods such as __init__ are exempt); no class docstrings,
 stray string statements or `#` comments, except tool directives (noqa, type:, pragma:, fmt:, pyright:)
@@ -16,6 +17,7 @@ import tokenize
 from collections.abc import Iterator
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PATHS = ("swarmeval", "tests", "examples", "tools")
 DIRECTIVES = ("noqa", "type:", "pragma:", "fmt:", "pyright:")
 MAX_SUMMARY_LINES = 2
@@ -23,8 +25,12 @@ FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 def is_test_file(path: Path) -> bool:
-    """True for files under tests/, where test names stand in for function summaries."""
-    return "tests" in path.parts
+    """True for files under the repo's top-level tests/, where test names stand in for function summaries."""
+    try:
+        parts = path.resolve().relative_to(ROOT).parts
+    except ValueError:
+        parts = path.parts
+    return bool(parts) and parts[0] == "tests"
 
 
 def docstring_node(body: list[ast.stmt]) -> ast.Constant | None:
@@ -100,9 +106,9 @@ def check_source(source: str, path: Path) -> list[tuple[int, str]]:
     return sorted(errors)
 
 
-def iter_files(paths: list[str]) -> Iterator[Path]:
+def iter_files(paths: list[Path]) -> Iterator[Path]:
     """Yield every ``.py`` file under the given files or directories."""
-    for p in map(Path, paths):
+    for p in paths:
         if p.is_file():
             yield p
         elif p.is_dir():
@@ -110,9 +116,13 @@ def iter_files(paths: list[str]) -> Iterator[Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Check the given paths, print violations as ``path:line: message``, and return 1 if any."""
-    paths = list(argv if argv is not None else sys.argv[1:]) or list(DEFAULT_PATHS)
+    """Check the given paths, print violations as ``path:line: message``, and return 1 if any (or a path is missing)."""
+    args = list(argv if argv is not None else sys.argv[1:])
+    paths = [Path(a) for a in args] or [ROOT / d for d in DEFAULT_PATHS]
     count = 0
+    for missing in [p for p in paths if not p.exists()]:
+        print(f"{missing}: no such file or directory")
+        count += 1
     for path in iter_files(paths):
         for line, message in check_source(path.read_text(encoding="utf-8"), path):
             print(f"{path}:{line}: {message}")
